@@ -6,41 +6,43 @@ import torch.optim as optim
 from torch.distributions import Normal
 from torch.utils.data import Dataset, DataLoader
 
+import cv2  # Für Graustufen-Konvertierung
+
 ###############################################
 # RL-Zoo / PPO-ähnliche Hyperparameter
 ###############################################
 GAMMA = 0.99
 LAMBDA = 0.95
-LR = 3e-4
-ROLLOUT_STEPS = 2048      # Anzahl Env-Schritte für eine PPG-Runde
+LR = 1e-4            # etwas kleinere LR für mehr Stabilität
+ROLLOUT_STEPS = 2048
 BATCH_SIZE = 64
-EPOCHS_PER_UPDATE = 10    # PPG-Phase-1-Trainings-Epochen
+EPOCHS_PER_UPDATE = 10
 CLIP_EPS = 0.2
-ENT_COEF = 0.0
+ENT_COEF = 0.01      # Etwas Entropie-Koeff. für bessere Exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 
 # PPG-spezifische
-AUX_EPOCHS = 2           # wie oft Value-only trainiert wird (Phase 2)
-MAX_ITERATIONS = 1000    # Anzahl Gesamt-Trainingszyklen
+AUX_EPOCHS = 2
+MAX_ITERATIONS = 1000
 
-# Zusätzliche VAE-Hyperparameter
-LATENT_DIM = 32          # Dimensionalität des VAE-Latent-Space
-VAE_BUFFER_SIZE = 30000  # Wie viele Frames maximal für VAE gesammelt werden
-VAE_TRAIN_EPOCHS = 5     # Wie viele Epochen pro VAE-Train-Durchlauf
-VAE_LR = 3e-4            # Lernrate für den VAE
-BETA_KL = 1.0            # Gewichtung der KL-Divergenz im VAE-Loss
+# VAE-Hyperparameter
+LATENT_DIM = 32          # Latent-Space-Größe
+VAE_BUFFER_SIZE = 30000  # Max Frames für VAE
+VAE_TRAIN_EPOCHS = 5     # Epochen pro VAE-Train
+VAE_LR = 3e-4
+BETA_KL = 0.5            # Weniger strenges Beta -> weniger starker KL-Drang
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ###################################################
-# 1) VAE-Modell
+# 1) VAE-Modell (1-Kanal statt 3)
 ###################################################
 class VAE(nn.Module):
     """
-    Einfaches Convolutional VAE für 96x96 RGB Frames.
+    VAE für 96x96 Graustufenbilder (1 Kanal).
     """
-    def __init__(self, latent_dim=32, img_channels=3, img_size=96):
+    def __init__(self, latent_dim=32, img_channels=1, img_size=96):
         super().__init__()
         self.latent_dim = latent_dim
 
@@ -67,7 +69,7 @@ class VAE(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose2d(64, 32, 4, 2, 1),    # [32, 48, 48]
             nn.ReLU(),
-            nn.ConvTranspose2d(32, img_channels, 4, 2, 1),  # [3, 96, 96]
+            nn.ConvTranspose2d(32, img_channels, 4, 2, 1),  # [1, 96, 96]
             nn.Sigmoid(),
         )
 
@@ -100,8 +102,7 @@ class VAE(nn.Module):
 ###################################################
 class VAEDataset(Dataset):
     """
-    Speichert RGB-Frames [H, W, C] in einer Liste.
-    Gibt Tensoren [C, H, W] in [0,1] zurück.
+    Enthält 96x96-Graustufenframes: [96, 96, 1].
     """
     def __init__(self, frames):
         self.frames = frames
@@ -110,9 +111,10 @@ class VAEDataset(Dataset):
         return len(self.frames)
 
     def __getitem__(self, idx):
-        frame = self.frames[idx]  # [H, W, C], Werte 0..255
+        # frame shape: [96, 96, 1], Werte 0..255
+        frame = self.frames[idx]
         frame_tensor = torch.from_numpy(frame).float() / 255.0
-        # Permute nach [C, H, W]
+        # [96, 96, 1] -> [1, 96, 96]
         frame_tensor = frame_tensor.permute(2, 0, 1)
         return frame_tensor
 
@@ -126,17 +128,13 @@ class VAETrainer:
 
     def loss_function(self, x, x_recon, mu, logvar):
         """
-        Rekonstruktionsverlust (MSE) + Beta-KL
+        Rekonstruktionsloss + Beta-KL
         """
         recon_loss = nn.functional.mse_loss(x_recon, x, reduction="sum")
-        # KL = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return recon_loss + self.beta_kl * kl_loss
 
     def train_vae(self, frames, epochs=5, batch_size=64):
-        """
-        Kurzes Training des VAE auf den gesammelten frames.
-        """
         dataset = VAEDataset(frames)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -151,7 +149,6 @@ class VAETrainer:
                 loss = self.loss_function(batch, x_recon, mu, logvar)
                 loss.backward()
                 self.optimizer.step()
-
                 total_loss += loss.item()
 
             avg_loss = total_loss / len(dataloader.dataset)
@@ -159,7 +156,7 @@ class VAETrainer:
 
 
 ###################################################
-# 3) ActorCritic (nutzt latente Vektoren)
+# 3) ActorCritic (1-Kanal VAE latent)
 ###################################################
 class ActorCritic(nn.Module):
     def __init__(self, latent_dim, action_dim=3, hidden_size=256):
@@ -199,7 +196,6 @@ class ActorCritic(nn.Module):
     def get_logp_value(self, latent, action):
         with torch.no_grad():
             self.log_std.data = torch.clamp(self.log_std.data, -2.0, 1.0)
-
         mu = self.forward_policy(latent)
         std = torch.exp(self.log_std)
         dist = Normal(mu, std)
@@ -242,7 +238,7 @@ class PPGTrainer:
         clip_eps=CLIP_EPS,
         vf_coef=VF_COEF,
         max_grad_norm=MAX_GRAD_NORM,
-        ent_coef=ENT_COEF,
+        ent_coef=ENT_COEF,   # <-- jetzt 0.01
         epochs_per_update=EPOCHS_PER_UPDATE,
         aux_epochs=AUX_EPOCHS,
         batch_size=BATCH_SIZE,
@@ -288,7 +284,14 @@ class PPGTrainer:
 
                 value_loss = (b_ret - v_pred).pow(2).mean()
 
-                loss = pg_loss + self.vf_coef * value_loss
+                # Optional: Entropie
+                # Dist ermitteln:
+                mu = self.net.forward_policy(b_latent)
+                std = torch.exp(self.net.log_std)
+                dist = Normal(mu, std)
+                entropy = dist.entropy().sum(dim=-1).mean()
+
+                loss = pg_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -328,10 +331,6 @@ class PPGTrainer:
             p.requires_grad = True
 
     def train_one_iteration(self, rollouts):
-        """
-        - compute GAE
-        - call ppg_update
-        """
         latent_obs = rollouts["latent_obs"]
         act_array = rollouts["actions"]
         rew_array = rollouts["rewards"]
@@ -358,16 +357,15 @@ class PPGTrainer:
 ###################################################
 class VAEFrameBuffer:
     """
-    Speichert die letzten max_size Frames für den VAE.
+    Speichert die letzten max_size Graustufen-Frames.
     """
     def __init__(self, max_size=30000):
         self.max_size = max_size
         self.frames = []
 
     def add_frame(self, frame):
-        # frame: [H, W, C]
+        # frame: [96, 96, 1] Graustufen
         if len(self.frames) >= self.max_size:
-            # Entferne älteste
             self.frames.pop(0)
         self.frames.append(frame)
 
@@ -381,17 +379,26 @@ class VAEFrameBuffer:
 ###################################################
 # 7) Rollout-Funktionen
 ###################################################
+def to_grayscale(frame_rgb):
+    """
+    frame_rgb: [96, 96, 3], Werte 0..255
+    => Rückgabe: [96, 96, 1], Graustufe
+    """
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)  # [96,96]
+    gray = np.expand_dims(gray, axis=-1)               # [96,96,1]
+    return gray
+
+
 def collect_rollout_for_vae(env, vae_frame_buffer, steps=1000):
     """
-    Sammelt einige Frames mittels Zufallsaktion,
-    um den VAE-Buffer zu füllen (z.B. in den ersten Iterationen).
+    Sammelt Frames per Zufallsaktion in Graustufen.
     """
     obs = env.reset()[0]
     for _ in range(steps):
-        # Füge Frame in Puffer
-        vae_frame_buffer.add_frame(obs)
+        # Convert to grayscale
+        gray_frame = to_grayscale(obs)
+        vae_frame_buffer.add_frame(gray_frame)
 
-        # Zufallsaktion
         action = env.action_space.sample()
         obs, reward, done, truncated, info = env.step(action)
         if done or truncated:
@@ -400,8 +407,7 @@ def collect_rollout_for_vae(env, vae_frame_buffer, steps=1000):
 
 def collect_car_racing_rollout(env, vae, net, rollout_steps=2048, device=DEVICE):
     """
-    Sammle Rollout für PPG (Policy-gesteuert).
-    Encodiere state über VAE -> latent_obs.
+    Sammelt Rollout für PPG, Graustufen + VAE -> latenter State.
     """
     obs_buffer = []
     latent_buffer = []
@@ -415,13 +421,16 @@ def collect_car_racing_rollout(env, vae, net, rollout_steps=2048, device=DEVICE)
     total_reward = 0.0
 
     for t in range(rollout_steps):
-        # (1) VAE-Encoden
-        obs_tensor = torch.tensor(obs, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
+        # 1) Graustufen
+        gray_frame = to_grayscale(obs)
+
+        # 2) VAE-Encoden
+        obs_tensor = torch.tensor(gray_frame, dtype=torch.float32).permute(2,0,1).unsqueeze(0).to(device) / 255.0
         with torch.no_grad():
             mu, logvar = vae.encode(obs_tensor)
             z = vae.reparameterize(mu, logvar)  # [1, latent_dim]
 
-        # (2) Aktion via Policy
+        # 3) Aktion via Policy
         with torch.no_grad():
             net.log_std.data = torch.clamp(net.log_std.data, -2.0, 1.0)
             mu_ac = net.forward_policy(z)
@@ -432,18 +441,17 @@ def collect_car_racing_rollout(env, vae, net, rollout_steps=2048, device=DEVICE)
             value = net.forward_value(z).squeeze(-1)
 
         action_np = action.cpu().numpy()[0]
-        # Clamping
+        # Clamping [steer, gas, brake]
         steer = np.clip(action_np[0], -1.0, 1.0)
-        gas = np.clip(action_np[1], 0.0, 1.0)
+        gas   = np.clip(action_np[1],  0.0, 1.0)
         brake = np.clip(action_np[2], 0.0, 1.0)
         action_clamped = np.array([steer, gas, brake], dtype=np.float32)
 
-        # Schritt im Env
         obs_new, reward, done, truncated, info = env.step(action_clamped)
         total_reward += reward
 
-        # Daten für PPG
-        obs_buffer.append(obs)
+        # 4) Speichern
+        obs_buffer.append(gray_frame)  # optional, falls wir Frames speichern wollen
         latent_buffer.append(z.squeeze(0).cpu().numpy())
         act_buffer.append(action_np)
         logp_buffer.append(logp.item())
@@ -455,11 +463,12 @@ def collect_car_racing_rollout(env, vae, net, rollout_steps=2048, device=DEVICE)
         if done or truncated:
             obs = env.reset()[0]
 
+    # Bootstrap
     if done:
         last_val = 0.0
     else:
-        # Bootstrap
-        obs_tensor = torch.tensor(obs, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
+        gray_frame = to_grayscale(obs)
+        obs_tensor = torch.tensor(gray_frame, dtype=torch.float32).permute(2,0,1).unsqueeze(0).to(device) / 255.0
         with torch.no_grad():
             mu, logvar = vae.encode(obs_tensor)
             z = vae.reparameterize(mu, logvar)
@@ -488,57 +497,61 @@ def train_ppg_with_vae():
     obs = env.reset(seed=42)[0]
 
     # 1) VAE + Trainer
-    vae = VAE(latent_dim=LATENT_DIM, img_channels=3, img_size=96).to(DEVICE)
+    #    => Graustufen => 1 Kanal
+    vae = VAE(latent_dim=LATENT_DIM, img_channels=1, img_size=96).to(DEVICE)
     vae_trainer = VAETrainer(vae, lr=VAE_LR, beta_kl=BETA_KL, device=DEVICE)
     vae_buffer = VAEFrameBuffer(max_size=VAE_BUFFER_SIZE)
 
-    # 2) Erstmal etwas Buffer füllen (Zufallsaktionen)
+    # 2) Buffer füllen mit Zufallsaktionen
     print("[Init] Sammle erste Frames für VAE-Puffer ...")
-    collect_rollout_for_vae(env, vae_buffer, steps=5000)  # z.B. 5000 Zufalls-Schritte
-    print(f"[Init] VAE-Puffer gefüllt mit {vae_buffer.size()} Frames.")
+    collect_rollout_for_vae(env, vae_buffer, steps=5000)
+    print(f"[Init] VAE-Puffer gefüllt mit {vae_buffer.size()} Graustufen-Frames.")
 
-    # 3) Erste VAE-Trainings-Session
+    # 3) Erstes VAE-Training
     print("[Init] Trainiere VAE (erster Durchgang) ...")
     frames_init = vae_buffer.get_all_frames()
     vae_trainer.train_vae(frames_init, epochs=VAE_TRAIN_EPOCHS, batch_size=BATCH_SIZE)
 
     # 4) ActorCritic + PPG
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.shape[0]  # 3
     net = ActorCritic(latent_dim=LATENT_DIM, action_dim=action_dim, hidden_size=256)
     optimizer = optim.Adam(net.parameters(), lr=LR)
-    ppg_trainer = PPGTrainer(net, optimizer,
-                             clip_eps=CLIP_EPS,
-                             vf_coef=VF_COEF,
-                             max_grad_norm=MAX_GRAD_NORM,
-                             ent_coef=ENT_COEF,
-                             epochs_per_update=EPOCHS_PER_UPDATE,
-                             aux_epochs=AUX_EPOCHS,
-                             batch_size=BATCH_SIZE,
-                             gamma=GAMMA,
-                             lam=LAMBDA,
-                             device=DEVICE)
+
+    ppg_trainer = PPGTrainer(
+        net,
+        optimizer,
+        clip_eps=CLIP_EPS,
+        vf_coef=VF_COEF,
+        max_grad_norm=MAX_GRAD_NORM,
+        ent_coef=ENT_COEF,        # 0.01
+        epochs_per_update=EPOCHS_PER_UPDATE,
+        aux_epochs=AUX_EPOCHS,
+        batch_size=BATCH_SIZE,
+        gamma=GAMMA,
+        lam=LAMBDA,
+        device=DEVICE
+    )
 
     # 5) Haupt-Trainingsschleife
     for iteration in range(MAX_ITERATIONS):
         print(f"=== Iteration {iteration+1}/{MAX_ITERATIONS} ===")
 
-        # a) Sammle Rollout für PPG (Nutzung vom aktuellen VAE + Net)
+        # a) Rollout mit aktuellem Policy+VAE
         rollouts, ep_reward = collect_car_racing_rollout(env, vae, net, rollout_steps=ROLLOUT_STEPS, device=DEVICE)
-        print(f"Gesammelter Rollout: {len(rollouts['rewards'])} Schritte, R={ep_reward:.2f}")
+        print(f"[Iteration {iteration+1}] Rollout Steps: {len(rollouts['rewards'])}, Reward={ep_reward:.2f}")
 
-        # b) Füge die neuen Frames dem VAE-Puffer hinzu
-        #    (So lernst du neue Visuals, z.B. neue Streckenabschnitte)
-        for frame in rollouts["obs"]:
-            vae_buffer.add_frame(frame)
+        # b) Frames in VAE-Puffer
+        for frame_gray in rollouts["obs"]:
+            vae_buffer.add_frame(frame_gray)
 
-        # c) Trainiere VAE erneut auf aktuellen Frames
+        # c) VAE-Training erneut
         frames_now = vae_buffer.get_all_frames()
         vae_trainer.train_vae(frames_now, epochs=VAE_TRAIN_EPOCHS, batch_size=BATCH_SIZE)
 
         # d) PPG-Update
         ppg_trainer.train_one_iteration(rollouts)
 
-        print(f"[Iteration {iteration+1}] Fertig. (Episode Reward ~ {ep_reward:.1f})")
+        print(f"[Iteration {iteration+1}] Fertig. EpisodeReward={ep_reward:.2f}")
 
     env.close()
 
