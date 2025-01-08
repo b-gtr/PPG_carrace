@@ -6,36 +6,34 @@ import threading
 import numpy as np
 import torch
 
-# Wir verwenden Gymnasium, NICHT gym
-import gymnasium as gym
-from gymnasium import spaces
-
-# Shimmy-Wrapper, um Gymnasium-Env in "altes Gym" für SB3 zu übersetzen
-from shimmy import GymV26CompatibilityV0
+# WICHTIG: Gym (alte Version), NICHT gymnasium
+import gym
+from gym import spaces
 
 # Stable-Baselines3
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from stable_baselines3.common.monitor import Monitor
 
 try:
     import carla
 except ImportError:
-    raise RuntimeError("Fehler: CARLA-Python-API nicht gefunden. Bitte Carla installieren bzw. PYTHONPATH setzen.")
+    raise RuntimeError("Fehler: CARLA-Python-API nicht gefunden. Bitte Carla installieren und PYTHONPATH setzen.")
 
 # Trainingsparameter
 MAX_STEPS_PER_EPISODE = 1000
-LOAD_MODEL = False               # Falls du bereits trainierte Parameter laden möchtest
+LOAD_MODEL = False
 MODEL_PATH = "ppo_carla_model.zip"
-TOTAL_TIMESTEPS = 50_000         # Anzahl Trainingsschritte (anpassbar)
+TOTAL_TIMESTEPS = 50_000
 
 # Gerät initialisieren
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_gpus = torch.cuda.device_count()
 print(f"Number of GPUs available: {num_gpus}")
 
+
 # -------------------------------------------------------
-# 1) Native CarlaEnv (ohne Gymnasium) -- Kapselt Fahrzeug & Sensorik
+# 1) Native CarlaEnv (ohne Gym) -- Kapselt Fahrzeug & Sensorik
 # -------------------------------------------------------
 class Sensor:
     """
@@ -100,32 +98,30 @@ class CameraSensor(Sensor):
     def listen(self):
         def callback(image):
             """
-            Verarbeitet das semantische Segmentierungsbild.
-            Wir nehmen den R-Kanal (image[:, :, 2]),
-            da Carla die Segmentation-Labels dort speichert.
-            Normalisiert auf [0,1].
+            Verarbeitet das semantische Segmentierungsbild (Labels im R-Kanal).
+            Normalisierung auf [0,1].
             """
             image.convert(carla.ColorConverter.Raw)
             array = np.frombuffer(image.raw_data, dtype=np.uint8)
             array = array.reshape((image.height, image.width, 4))
             labels = array[:, :, 2]
 
-            # Normalisieren auf [0, 1], in Carla ~22 Label-Klassen
             with self.image_lock:
-                self.latest_image = labels / 22.0
+                self.latest_image = labels / 22.0  # ~22 Klassen in Carla
 
         self.sensor.listen(callback)
 
 
 class CarlaEnv:
     """
-    Nicht-Gym-Umgebung, rein zum Steuern von Carla im synchronen Modus.
+    Klasse, die die CARLA-Umgebung im synchronen Modus startet
+    und ein Fahrzeug + Sensoren aufbaut.
     """
     def __init__(self):
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
 
-        # Lade Town10HD_Opt (oder z.B. Town01)
+        # Lade Town10HD_Opt (oder Town01 etc.)
         self.client.load_world('Town10HD_Opt')
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
@@ -146,7 +142,6 @@ class CarlaEnv:
         settings.fixed_delta_seconds = 0.05  # 20 FPS
         self.world.apply_settings(settings)
 
-        # Environment zurücksetzen
         self.reset_environment()
 
     def reset_environment(self):
@@ -155,14 +150,14 @@ class CarlaEnv:
             self.vehicle.destroy()
             self.vehicle = None
 
-        # Spawn
+        # Zufälliger Spawnpoint
         vehicle_bp = self.blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
         self.spawn_point = random.choice(self.spawn_points)
         self.vehicle = self.world.spawn_actor(vehicle_bp, self.spawn_point)
 
         self.setup_sensors()
 
-        # Ein paar Ticks
+        # Ein paar Ticks warten, damit Sensoren initialisiert sind
         for _ in range(10):
             self.world.tick()
 
@@ -194,7 +189,6 @@ class CarlaEnv:
         return math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
 
     def destroy(self):
-        # Ursprüngliche Einstellungen wiederherstellen
         self.world.apply_settings(self.original_settings)
         if self.vehicle is not None:
             self.vehicle.destroy()
@@ -220,23 +214,19 @@ class CarlaEnv:
         lateral_offset = dx * perpendicular_direction.x + dy * perpendicular_direction.y
         return lane_center, lateral_offset
 
-
 # -------------------------------------------------------
-# 2) Gymnasium-Env, die CarlaEnv umschließt
-#    => (obs, reward, done, truncated, info)
+# 2) Gym-Wrapper, der CarlaEnv in eine gym.Env verwandelt
 # -------------------------------------------------------
 class CarlaGymEnv(gym.Env):
     """
-    Gymnasium-Env, die intern CarlaEnv nutzt.
-    Beobachtung wird als (1, 480, 640) zurückgegeben => Channel-First
+    Aus der CarlaEnv machen wir jetzt eine gym.Env mit reset() und step().
+    Wir geben das Bild in (H, W, C) => (480, 640, 1) an; SB3 kann das transponieren.
     """
-    metadata = {"render_modes": ["human"]}
-
     def __init__(self):
         super(CarlaGymEnv, self).__init__()
         self.env = CarlaEnv()
 
-        # Action Space: 2 Dimensionen: Steer + Throttle ∈ [-1,1]
+        # Action Space: 2 Dim (Steer, Throttle)
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -244,26 +234,23 @@ class CarlaGymEnv(gym.Env):
             dtype=np.float32
         )
 
-        # *** Wichtig: Channel-First => (1, 480, 640) ***
-        # So kann Shimmy + SB3 das ohne Probleme verarbeiten.
+        # Observation Space: (480, 640, 1)
+        # => wir werden später VecTransposeImage benutzen, um (C,H,W) für SB3 zu bekommen.
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(1, 480, 640),  
+            shape=(480, 640, 1),
             dtype=np.float32
         )
 
-        self.max_step = MAX_STEPS_PER_EPISODE
+        self.max_steps = MAX_STEPS_PER_EPISODE
         self.current_step = 0
         self.previous_distance = None
 
-        # Ziel (wird in reset() überschrieben)
         direction_vector = self.env.spawn_point.rotation.get_forward_vector()
         self.destination = self.env.spawn_point.location + direction_vector * 40
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-
+    def reset(self):
         self.env.reset_environment()
         direction_vector = self.env.spawn_point.rotation.get_forward_vector()
         self.destination = self.env.spawn_point.location + direction_vector * 40
@@ -271,73 +258,62 @@ class CarlaGymEnv(gym.Env):
         self.current_step = 0
 
         obs = self._get_observation()
-        # Gymnasium: reset() => (obs, info)
-        return obs, {}
+        return obs
 
     def step(self, action):
-        """
-        Rückgabe: (obs, reward, done, truncated, info)
-        """
-        steer = float(action[0])      # ∈ [-1,1]
-        throttle = float(action[1])   # ∈ [-1,1]
+        steer = float(action[0])  # ∈ [-1,1]
+        throttle = float(action[1])  # ∈ [-1,1]
 
-        # Skaliere / clamp
         steer = steer / 2.0
         throttle = 0.5 * (1 + throttle)
+
         control = carla.VehicleControl(
             steer=np.clip(steer, -1.0, 1.0),
             throttle=np.clip(throttle, 0.0, 1.0)
         )
         self.env.vehicle.apply_control(control)
 
-        # Simulations-Tick
         self.env.world.tick()
         self.current_step += 1
 
-        # Reward
-        reward, done, info = self._compute_reward_done_info()
-        truncated = False
-        if self.current_step >= self.max_step and not done:
-            truncated = True
+        reward, done = self._compute_reward_and_done()
 
         obs = self._get_observation()
-        return obs, reward, done, truncated, info
+        info = {}
 
-    def close(self):
-        self.env.destroy()
-        super().close()
+        return obs, reward, done, info
 
     def _get_observation(self):
-        """
-        Liefert ein 3D-Array mit shape (1,480,640).
-        """
         with self.env.image_lock:
             if self.env.camera_sensor and self.env.camera_sensor.latest_image is not None:
-                # Carla-Bild: (480,640)
+                # shape (480,640)
                 img = self.env.camera_sensor.latest_image
-                # => channel-first => (1,480,640)
-                img = np.expand_dims(img, axis=0)
+                # => (480,640,1)
+                img = np.expand_dims(img, axis=-1)
                 return img.astype(np.float32)
             else:
-                return np.zeros((1, 480, 640), dtype=np.float32)
+                return np.zeros((480,640,1), dtype=np.float32)
 
-    def _compute_reward_done_info(self):
+    def _compute_reward_and_done(self):
         # Kollision?
         if len(self.env.collision_sensor.history) > 0:
-            return -30.0, True, {"termination_reason": "collision"}
+            return -30.0, True
 
-        # Fahrzeug-Position
+        # Zeit abgelaufen?
+        if self.current_step >= self.max_steps:
+            return -10.0, True
+
         location = self.env.vehicle.get_transform().location
         distance_to_destination = location.distance(self.destination)
         if self.previous_distance is None:
             self.previous_distance = distance_to_destination
 
-        # Lane-Abweichung
         lane_center, lateral_offset = self.env.get_lane_center_and_offset()
         if lane_center is None:
             # Kein Waypoint
-            return -1.0, False, {}
+            return -1.0, False
 
+        # Belohnung aus deinem SAC-Beispiel
         deviation_threshold = 0.7
         deviation_penalty_scale = 4.0
         if abs(lateral_offset) <= deviation_threshold:
@@ -353,7 +329,8 @@ class CarlaGymEnv(gym.Env):
         # Heading
         transform = self.env.vehicle.get_transform()
         yaw = math.radians(transform.rotation.yaw)
-        waypoint = self.env.world.get_map().get_waypoint(location)
+        map_ = self.env.world.get_map()
+        waypoint = map_.get_waypoint(location)
         next_waypoints = waypoint.next(2.0)
         if next_waypoints:
             next_wp = next_waypoints[0]
@@ -366,7 +343,7 @@ class CarlaGymEnv(gym.Env):
         desired_yaw = math.atan2(dy, dx)
         epsilon = desired_yaw - yaw
         epsilon = (epsilon + math.pi) % (2 * math.pi) - math.pi
-        r_heading = -(abs(epsilon) / 3.0)**2
+        r_heading = -(abs(epsilon) / 3)**2
 
         # Travel
         if distance_to_destination < self.previous_distance:
@@ -378,31 +355,30 @@ class CarlaGymEnv(gym.Env):
         r_overspeed = -5.0 if speed > 25 else 0.0
 
         reward = r_lane_centering + r_speed + r_heading + r_traveled + r_overspeed
-        done = False
         self.previous_distance = distance_to_destination
+        return reward, False
 
-        return reward, done, {}
-
+    def close(self):
+        self.env.destroy()
+        super().close()
 
 # -------------------------------------------------------
-# 3) Hauptprogramm mit Shimmy-Wrapper + SB3 (PPO)
+# 3) Hauptprogramm: PPO mit SB3
 # -------------------------------------------------------
 def main():
-    # 1) Erstelle unsere Gymnasium-Env
+    # 1) Instanziiere unser Gym-Env
     env = CarlaGymEnv()
 
-    # 2) Kompatibilitäts-Wrapper (shimmy), NUR wenn SB3 das alte Gym-API erwartet:
-    env = GymV26CompatibilityV0(env=env)
-
-    # 3) Monitor-Wrapper für Logging
+    # 2) Monitor-Wrapper (Logging)
     env = Monitor(env)
 
-    # 4) DummyVecEnv (1 Environment)
+    # 3) Für SB3 brauchen wir VecEnv
     vec_env = DummyVecEnv([lambda: env])
 
-    # Wir brauchen KEIN VecTransposeImage mehr, da wir schon (C,H,W) zurückgeben!
-    # => Mit (1,480,640) ist bereits channel-first.
+    # 4) Transponiere (H,W,C)->(C,H,W) für CnnPolicy
+    vec_env = VecTransposeImage(vec_env)
 
+    # PPO-Hyperparameter
     ppo_hyperparams = dict(
         n_steps=2048,
         batch_size=64,
@@ -418,6 +394,7 @@ def main():
         device=device
     )
 
+    # 5) PPO instanziieren
     model = PPO(
         policy="CnnPolicy",
         env=vec_env,
@@ -428,20 +405,20 @@ def main():
         model = PPO.load(MODEL_PATH, env=vec_env)
         print("Modellparameter geladen.")
 
-    # Training
+    # 6) Training
     model.learn(total_timesteps=TOTAL_TIMESTEPS)
 
-    # Speichern
+    # 7) Speichern
     model.save(MODEL_PATH)
     print(f"Modell unter '{MODEL_PATH}' gespeichert.")
 
-    # Optional: Testen
-    obs, _ = env.reset()
+    # 8) Testen (optional)
+    obs = env.reset()
     for _ in range(500):
         action, _states = model.predict(obs, deterministic=True)
-        obs, reward, done, truncated, info = env.step(action)
-        if done or truncated:
-            obs, _ = env.reset()
+        obs, reward, done, info = env.step(action)
+        if done:
+            obs = env.reset()
 
     env.close()
 
