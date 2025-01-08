@@ -7,9 +7,11 @@ import time
 
 import carla
 
+# Gymnasium statt altes Gym
 import gymnasium as gym
 from gymnasium import spaces
 
+# Stable Baselines3
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from stable_baselines3.common.monitor import Monitor
@@ -91,6 +93,11 @@ class CameraSensor(Sensor):
         self.sensor.listen(self.image_processor_callback)
 
 class CarlaEnv(gym.Env):
+    """
+    Gymnasium-Umgebung für CARLA, kompatibel mit SB3.
+    Gibt reset() -> (obs, info), step() -> (obs, reward, done, truncated, info) zurück.
+    """
+
     def __init__(self, render_mode=None):
         super(CarlaEnv, self).__init__()
 
@@ -98,6 +105,7 @@ class CarlaEnv(gym.Env):
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
 
+        # Welt laden
         self.client.load_world('Town01')
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
@@ -145,7 +153,7 @@ class CarlaEnv(gym.Env):
     def reset_environment(self):
         self._clear_sensors()
 
-        # Altes Fahrzeug zerstören
+        # Fahrzeug ggf. zerstören
         if self.vehicle is not None:
             try:
                 self.vehicle.destroy()
@@ -155,8 +163,7 @@ class CarlaEnv(gym.Env):
 
         self.collision_occured = False
 
-        # --- Feste Spawn-Location statt random.choice ---
-        # z.B. immer self.spawn_points[0]
+        # Feste Spawn-Location
         self.spawn_point = self.spawn_points[0]
         self.spawn_rotation = self.spawn_point.rotation
 
@@ -171,6 +178,7 @@ class CarlaEnv(gym.Env):
 
         self.current_step = 0
 
+        # Mehrere Ticks, damit das erste Bild ankommt
         for _ in range(5):
             self.world.tick()
 
@@ -247,7 +255,6 @@ class CarlaEnv(gym.Env):
             return None, 0.0
 
         lane_center = waypoint.transform.location
-
         dx = vehicle_location.x - lane_center.x
         dy = vehicle_location.y - lane_center.y
 
@@ -346,6 +353,10 @@ class CarlaEnv(gym.Env):
         return obs
 
     def reset(self, seed=None, options=None):
+        """
+        Gymnasium reset-Signatur:
+        -> (observation, info)
+        """
         super().reset(seed=seed)
         self.reset_environment()
         obs = self._get_observation()
@@ -371,14 +382,15 @@ class CarlaEnv(gym.Env):
             self.vehicle.destroy()
 
 def main():
-    # Environment erstellen und monitoren
+    # 1) Environment erstellen
     env = CarlaEnv()
     env = Monitor(env)
 
+    # 2) Vektor-Umgebung
     vec_env = DummyVecEnv([lambda: env])
     vec_env = VecTransposeImage(vec_env)
 
-    # PPO-Parameter, device="cuda" für GPU
+    # 3) PPO-Konfiguration
     ppo_hyperparams = dict(
         n_steps=2048,
         batch_size=64,
@@ -391,33 +403,38 @@ def main():
         gae_lambda=0.95,
         max_grad_norm=0.5,
         verbose=1,
-        device="cuda",  # <--- GPU-Nutzung
+        device="cuda",  # wenn PyTorch mit CUDA installiert
     )
 
+    # 4) PPO-Modell
     model = PPO(
         policy="CnnPolicy",
         env=vec_env,
         **ppo_hyperparams
     )
 
-    total_timesteps = 50_000
+    total_timesteps = 10_000  # zum Testen etwas weniger
     model.learn(total_timesteps=total_timesteps)
 
     model.save("ppo_carla_model_gpu")
 
-    # Testumgebung
+    # Testepisode
     print("Training abgeschlossen. Starte Testepisode ...")
     test_env = CarlaEnv()
     test_env = Monitor(test_env)
     test_env = DummyVecEnv([lambda: test_env])
     test_env = VecTransposeImage(test_env)
 
-    obs, _ = test_env.reset()
+    # -> (obs, info) bei Gymnasium
+    obs, info = test_env.reset()
+
     for _ in range(300):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = test_env.step(action)
+        # Hier könntest du optional: test_env.render()
+
         if done or truncated:
-            obs, _ = test_env.reset()
+            obs, info = test_env.reset()
 
     test_env.close()
 
