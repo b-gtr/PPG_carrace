@@ -6,11 +6,11 @@ import threading
 import numpy as np
 import torch
 
-# Wir verwenden Gymnasium statt Gym
+# Wir verwenden Gymnasium, NICHT gym
 import gymnasium as gym
 from gymnasium import spaces
 
-# Shimmy-Wrapper für Kompatibilität mit stable-baselines3
+# Shimmy-Wrapper, um Gymnasium-Env in "altes Gym" für SB3 zu übersetzen
 from shimmy import GymV26CompatibilityV0
 
 # Stable-Baselines3
@@ -21,7 +21,7 @@ from stable_baselines3.common.monitor import Monitor
 try:
     import carla
 except ImportError:
-    raise RuntimeError("Fehler: CARLA-Python-API nicht gefunden. Bitte CARLA installieren.")
+    raise RuntimeError("Fehler: CARLA-Python-API nicht gefunden. Bitte Carla installieren bzw. PYTHONPATH setzen.")
 
 # Trainingsparameter
 MAX_STEPS_PER_EPISODE = 1000
@@ -98,7 +98,7 @@ class CameraSensor(Sensor):
         def callback(image):
             """
             Verarbeitet das semantische Segmentierungsbild.
-            Wir nehmen den R-Kanal (image[:, :, 2]), 
+            Wir nehmen den R-Kanal (image[:, :, 2]),
             da Carla die Segmentation-Labels dort speichert.
             Normalisiert auf [0,1].
             """
@@ -121,7 +121,7 @@ class CarlaEnv:
     def __init__(self):
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
-        # Lade eine gewünschte Map (z.B. Town10HD_Opt oder Town01)
+        # Lade Town10HD_Opt oder Town01 oder eine andere Map:
         self.client.load_world('Town10HD_Opt')
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
@@ -392,11 +392,11 @@ def main():
     # 1) Erstelle unsere Gymnasium-Env
     env = CarlaGymEnv()
 
-    # 2) Wandle das Gymnasium-Env in ein "altes Gym-Env" um,
-    #    damit stable-baselines3 das versteht
-    env = GymV26CompatibilityV0(env)
+    # 2) Erzeuge einen Kompatibilitäts-Wrapper, indem wir "env=..." übergeben!
+    #    Dadurch interpretiert GymV26CompatibilityV0 das Objekt NICHT als Env-ID-String.
+    env = GymV26CompatibilityV0(env=env)
 
-    # 3) Monitor-Wrapper für Logging
+    # 3) Monitor-Wrapper für Logging (Stable-Baselines3)
     env = Monitor(env)
 
     # 4) DummyVecEnv -> wir brauchen Vektorisierung für SB3
@@ -405,6 +405,7 @@ def main():
     # 5) Für CNN-Policy: Transponiere (H,W,C) -> (C,H,W)
     vec_env = VecTransposeImage(vec_env)
 
+    # PPO-Hyperparameter
     ppo_hyperparams = dict(
         n_steps=2048,
         batch_size=64,
@@ -426,7 +427,6 @@ def main():
         **ppo_hyperparams
     )
 
-    # (Optional) Vorher trainiertes Modell laden
     if LOAD_MODEL and os.path.exists(MODEL_PATH):
         model = PPO.load(MODEL_PATH, env=vec_env)
         print("Modellparameter geladen.")
