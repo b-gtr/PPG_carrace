@@ -120,7 +120,6 @@ class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
 
         c, h, w = observation_space.shape
 
-        # Beispielhafte CNN-Architektur
         self.cnn = nn.Sequential(
             nn.Conv2d(c, 32, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -131,12 +130,11 @@ class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
             nn.Flatten(),
         )
 
-        # Ermittlung der Größe nach CNN (n_flatten)
+        # Größe nach CNN bestimmen
         with torch.no_grad():
             dummy_input = torch.zeros((1, c, h, w), dtype=torch.float32)
             n_flatten = self.cnn(dummy_input).shape[1]
 
-        # Lineare Schicht auf CNN-Output
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
@@ -152,11 +150,11 @@ class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
 # -----------------------------------------------------
 class CarlaEnv(gym.Env):
     """
-    Gymnasium-Umgebung mit
-    - größerem Bild (800x600),
-    - Waypoints zur Routenführung,
-    - erweitertem Reward: Lane Deviations brechen nicht die Episode ab,
-      sondern erhöhen nur die Strafe, sofern man nicht zu weit von der Fahrbahnmitte weg ist.
+    Gymnasium-Umgebung mit:
+      - größerem Bild (800x600),
+      - Waypoints zur Routenführung (ohne Endlosschleife),
+      - erweitertem Reward: Lane Deviations brechen nicht die Episode ab,
+        nur Strafe - außer man ist sehr weit von der Fahrbahn.
     """
 
     def __init__(self, render_mode=None):
@@ -199,7 +197,10 @@ class CarlaEnv(gym.Env):
         # Observation Space: (H=600, W=800, C=3)
         self.observation_shape = (600, 800, 3)
         self.observation_space = spaces.Box(
-            low=0, high=255, shape=self.observation_shape, dtype=np.uint8
+            low=0,
+            high=255,
+            shape=self.observation_shape,
+            dtype=np.uint8
         )
 
         # Ziel, Kollisions-Flags etc.
@@ -246,39 +247,68 @@ class CarlaEnv(gym.Env):
         direction_vector = self.spawn_rotation.get_forward_vector()
         self.destination = self.spawn_point.location + direction_vector * 60
 
-        # Route mit Waypoints (alle 2m) erstellen
+        # Route mit Waypoints (alle 2m) erstellen (ohne Endlosschleife)
         self._generate_route()
 
         self.current_step = 0
 
-        # World ein paar Ticks nach vorne
+        # World ein paar Ticks vorlaufen lassen
         for _ in range(5):
             self.world.tick()
 
-    def _generate_route(self):
+    def _generate_route(self, max_waypoints=1000):
         """
-        Erzeugt eine einfache Liste von Waypoints anhand der Spawn-Position
-        bis (ungefähr) zur Destination. Verwendet waypoint.next(2.0).
+        Erzeugt eine Liste von Waypoints anhand der Spawn-Position
+        bis (ungefähr) zur Destination, ohne Endlosschleife.
         """
         self.route = []
-        start_waypoint = self.world.get_map().get_waypoint(self.spawn_point.location, project_to_road=True)
+        start_waypoint = self.world.get_map().get_waypoint(
+            self.spawn_point.location,
+            project_to_road=True
+        )
         if not start_waypoint:
             return
 
         current_wp = start_waypoint
-        while True:
-            self.route.append(current_wp)
-            next_wps = current_wp.next(2.0)  # <--- NUTZUNG DER WAYPOINT API
+        self.route.append(current_wp)
+        last_distance = current_wp.transform.location.distance(self.destination)
+
+        # Anzahl Schritte ohne Fortschritt
+        no_progress_count = 0
+        max_no_progress = 50
+
+        for _ in range(max_waypoints):
+            next_wps = current_wp.next(2.0)
             if not next_wps:
+                # Keine weiteren Waypoints
                 break
 
-            # Nimm z.B. nur den ersten Vorschlag
-            current_wp = next_wps[0]
+            # Nimm den ersten Vorschlag (alternativ könnte man hier den "besten" wählen)
+            next_wp = next_wps[0]
+            dist = next_wp.transform.location.distance(self.destination)
 
-            # Abbruch, wenn wir nahe genug an der Destination sind
-            if current_wp.transform.location.distance(self.destination) < 2.0:
-                self.route.append(current_wp)
+            # Abbruchbedingung: Nahe genug am Ziel
+            if dist < 2.0:
+                self.route.append(next_wp)
                 break
+
+            # Fortschrittskontrolle
+            if dist >= last_distance:
+                no_progress_count += 1
+            else:
+                no_progress_count = 0
+                last_distance = dist
+
+            if no_progress_count > max_no_progress:
+                print("[WARN] _generate_route(): Keine Annäherung an das Ziel – Abbruch.")
+                break
+
+            self.route.append(next_wp)
+            current_wp = next_wp
+
+        else:
+            # Falls man aus der for-Schleife kommt, ohne break => max_waypoints erreicht
+            print("[WARN] _generate_route(): Zu viele Waypoints erzeugt – Abbruch.")
 
     def setup_sensors(self):
         self.camera_sensor = CameraSensor(
@@ -326,8 +356,7 @@ class CarlaEnv(gym.Env):
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = array.reshape((image.height, image.width, 4))
 
-        # Beim ColorConverter.Raw sind die Kanalbelegungen etwas anders;
-        # wir übernehmen hier nur den Blau-Kanal als semantische ID (Bild wird 3-kanalig "aufgeblasen")
+        # Hier nutzen wir den Blau-Kanal als "Label" und machen 3 Kanäle draus
         labels = array[:, :, 2]
 
         with self.image_lock:
@@ -370,7 +399,7 @@ class CarlaEnv(gym.Env):
         steer = float(action[0])
         throttle = float(action[1])
 
-        # Steering etwas dämpfen, Throttle von [-1,1] auf [0,1] skalieren
+        # Steering "dämpfen", Throttle auf [0..1] abbilden
         steer_scaled = np.clip(steer / 2.0, -1.0, 1.0)
         throttle_scaled = np.clip(0.5 * (1 + throttle), 0.0, 1.0)
 
@@ -382,7 +411,7 @@ class CarlaEnv(gym.Env):
 
         self.world.tick()
 
-        # Kollisionen checken
+        # Kollisionen prüfen
         if len(self.collision_sensor.get_history()) > 0:
             self.collision_occured = True
 
@@ -396,9 +425,9 @@ class CarlaEnv(gym.Env):
         done = False
         truncated = False
 
-        # Falls sehr weit von der Spurmitte, Episode abbrechen (z.B. Offroad)
+        # Falls sehr weit von der Spurmitte -> Episode Ende (z.B. Offroad)
         _, lateral_offset = self.get_lane_center_and_offset()
-        if abs(lateral_offset) > 3.0:  # Grenze anpassbar
+        if abs(lateral_offset) > 3.0:  # Grenze anpassen
             done = True
 
         # Kollision -> Done
@@ -428,10 +457,10 @@ class CarlaEnv(gym.Env):
           - Ziel -> +100
           - Timeout -> -5
           - LaneInvasion -> -0.2 pro Invasion
-          - Geschwindigkeits-Kontrolle
+          - Geschwindigkeits-Kontrolle (Ziel: 30 km/h)
           - Distanz-Fortschritt
-          - Spurhaltung (Lateral Offset) mit Strafe statt Done
-          - Heading Bonus (Basierend auf waypoint.next(2.0))
+          - Spurhaltung (Lateral Offset) => Penalty, aber nicht sofort done
+          - Heading-Bonus via waypoint.next(2.0)
         """
         if done and self.collision_occured:
             return -100.0
@@ -442,13 +471,13 @@ class CarlaEnv(gym.Env):
 
         reward = 0.0
 
-        # Lane Invasion penalty (ohne Abbruch, nur Strafe)
+        # Lane Invasion penalty
         if self.lane_invasion_count > 0:
             reward -= 0.2 * self.lane_invasion_count
             self.lane_invasion_count = 0
 
-        # Speed control um ~30 km/h
-        speed = self.get_vehicle_speed() * 3.6
+        # Geschwindigkeits-Kontrolle
+        speed = self.get_vehicle_speed() * 3.6  # m/s -> km/h
         v_target = 30.0
         diff = abs(speed - v_target)
         if diff < 5:
@@ -468,14 +497,14 @@ class CarlaEnv(gym.Env):
                     reward -= 0.2
             self.previous_distance = current_distance
 
-        # Lateral offset (solange wir < 3.0 sind, wird nur penalized, aber nicht abgebrochen)
+        # Lateral Offset-Strafe, solange man nicht offroad (> 3.0) ist
         _, lateral_offset = self.get_lane_center_and_offset()
         if abs(lateral_offset) < 0.3:
             reward += 0.3
         else:
             reward -= 0.3
 
-        # Heading bonus (Waypoints)
+        # Heading Bonus
         r_heading = self._heading_bonus()
         reward += r_heading
 
@@ -484,10 +513,6 @@ class CarlaEnv(gym.Env):
         return reward
 
     def _heading_bonus(self):
-        """
-        Einfacher Heading-Bonus, indem wir das nächste Waypoint (2m voraus) nehmen.
-        Je kleiner der Winkel zur gewünschten Richtung, desto positiver der Reward.
-        """
         transform = self.vehicle.get_transform()
         yaw = math.radians(transform.rotation.yaw)
 
@@ -496,7 +521,7 @@ class CarlaEnv(gym.Env):
         if not waypoint:
             return 0.0
 
-        next_waypoints = waypoint.next(2.0)  # Waypoint API
+        next_waypoints = waypoint.next(2.0)
         if not next_waypoints:
             return 0.0
 
