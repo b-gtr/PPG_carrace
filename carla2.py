@@ -93,7 +93,7 @@ class GnssSensor(Sensor):
 class CameraSensor(Sensor):
     def __init__(self, vehicle, blueprint_library, world, image_processor_callback):
         super().__init__(vehicle)
-        # Beispiel: größere Auflösung, z. B. 800x600
+        # Höhere Auflösung: 800x600
         camera_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
         camera_bp.set_attribute('image_size_x', '800')
         camera_bp.set_attribute('image_size_y', '600')
@@ -107,41 +107,48 @@ class CameraSensor(Sensor):
 
 
 # -----------------------------------------------------
-#   Custom Features Extractor (Optional)
+#   Custom CNN Features Extractor
+#   -> Behebt das Kernel-Größenproblem, indem wir
+#      die Dimensionen richtig aus observation_space.shape auslesen.
 # -----------------------------------------------------
 class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
-    """
-    Beispielhafter Custom CNN, angelehnt an dein verlinktes Repo:
-    Evtl. tiefer oder breiter je nach Bedarf.
-    """
     def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
-        # observation_space.shape = (H, W, C)
+        """
+        observation_space.shape = (600, 800, 3)  # (H, W, C)
+        Nach VecTransposeImage sieht PyTorch-Eingabe wie (B, C=3, H=600, W=800) aus.
+        """
         super().__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[2]  # i. d. R. 3
 
-        # Baue dein CNN
+        # Entpacken
+        h, w, c = observation_space.shape  # z.B. 600, 800, 3
+        n_input_channels = c  # 3
+        height = h            # 600
+        width = w             # 800
+
+        # Beispiel-CNN ähnlich wie in deinem Repo
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=0),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
         )
+
         # Dummy Forward-Pass zum Dim-Bestimmen
         with torch.no_grad():
-            sample_input = torch.zeros((1, n_input_channels, observation_space.shape[0], observation_space.shape[1]))
-            n_flatten = self.cnn(sample_input).shape[1]
+            dummy_input = torch.zeros((1, n_input_channels, height, width), dtype=torch.float32)
+            n_flatten = self.cnn(dummy_input).shape[1]
 
-        # Anschließend lineares Mapping auf features_dim
+        # Lineares Mapping
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
         )
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # [B, C, H, W]
+        # observations: (B, C=3, H=600, W=800)
         x = self.cnn(observations)
         return self.linear(x)
 
@@ -151,8 +158,8 @@ class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
 # -----------------------------------------------------
 class CarlaEnv(gym.Env):
     """
-    Gymnasium-Umgebung mit veränderter Reward-Struktur,
-    größerer Bildauflösung und expansionsfähigem Setup.
+    Gymnasium-Umgebung mit größerem Bild (800x600),
+    verbesserter Reward-Struktur und fix für "kernel size can't be greater..."
     """
 
     def __init__(self, render_mode=None):
@@ -185,15 +192,14 @@ class CarlaEnv(gym.Env):
         self.latest_image = None
         self.agent_image = None
 
-        # Episode/Step
-        self.max_episode_steps = 600  # Erhöht, wenn du längere Episoden willst
+        # Episodengröße
+        self.max_episode_steps = 600
         self.current_step = 0
 
         # Action Space: [Steer, Throttle] in [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Observation Space:
-        # Da wir 800x600 in 3-Kanälen haben:
+        # Observation Space: (H=600, W=800, C=3)
         self.observation_shape = (600, 800, 3)
         self.observation_space = spaces.Box(
             low=0, high=255, shape=self.observation_shape, dtype=np.uint8
@@ -206,9 +212,9 @@ class CarlaEnv(gym.Env):
         self.collision_occured = False
         self.lane_invasion_count = 0
 
-        # Distanz-Tracking
+        # Distanz
         self.previous_distance = None
-        self.distance_threshold = 3.0  # Wie nah man ans Ziel muss, um als "erreicht" zu gelten
+        self.distance_threshold = 3.0
 
         self.reset_environment()
 
@@ -226,8 +232,8 @@ class CarlaEnv(gym.Env):
         self.lane_invasion_count = 0
         self.previous_distance = None
 
-        # Feste Startposition
-        self.spawn_point = random.choice(self.spawn_points)  # Oder self.spawn_points[0]
+        # Starte z. B. random, oder immer self.spawn_points[0]
+        self.spawn_point = random.choice(self.spawn_points)
         self.spawn_rotation = self.spawn_point.rotation
 
         vehicle_bp = self.blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
@@ -235,13 +241,12 @@ class CarlaEnv(gym.Env):
 
         self.setup_sensors()
 
-        # Beispiel: 60 Meter nach vorn als Ziel
+        # z. B. 60 Meter geradeaus
         direction_vector = self.spawn_rotation.get_forward_vector()
         self.destination = self.spawn_point.location + direction_vector * 60
 
         self.current_step = 0
 
-        # Erste Ticks
         for _ in range(5):
             self.world.tick()
 
@@ -293,7 +298,6 @@ class CarlaEnv(gym.Env):
         labels = array[:, :, 2]
 
         with self.image_lock:
-            # 1-Kanal in 3-Kanäle duplizieren
             labels_3ch = np.stack([labels, labels, labels], axis=-1)
             self.agent_image = labels_3ch
 
@@ -333,7 +337,7 @@ class CarlaEnv(gym.Env):
         steer = float(action[0])
         throttle = float(action[1])
 
-        # Steering und Throttle anpassen
+        # Steering / Throttle
         steer_scaled = np.clip(steer / 2.0, -1.0, 1.0)
         throttle_scaled = np.clip(0.5 * (1 + throttle), 0.0, 1.0)
 
@@ -345,12 +349,11 @@ class CarlaEnv(gym.Env):
 
         self.world.tick()
 
-        # Check Sensors
+        # Sensors
         if len(self.collision_sensor.get_history()) > 0:
             self.collision_occured = True
-        # Lane Invasion
         if len(self.lane_invasion_sensor.get_history()) > 0:
-            self.lane_invasion_count += 1
+            self.lane_invasion_count += len(self.lane_invasion_sensor.get_history())
             self.lane_invasion_sensor.clear_history()
 
         obs = self._get_observation()
@@ -358,10 +361,9 @@ class CarlaEnv(gym.Env):
         done = False
         truncated = False
 
-        # Endbedingung: Kollision
+        # Kollision => done
         if self.collision_occured:
             done = True
-        # Timeout
         elif self.current_step >= self.max_episode_steps:
             truncated = True
 
@@ -378,48 +380,42 @@ class CarlaEnv(gym.Env):
 
     def _compute_reward(self, done, truncated, reached_destination):
         """
-        Neue, erweiterte Reward-Struktur:
-          - Große negative Strafe bei Kollision -> -100
-          - Große positive Belohnung bei Ziel -> +100
+        Beispielhaft erweiterte Reward-Struktur:
+          - Kollision -> -100
+          - Ziel -> +100
           - Timeout -> -5
-          - Lane Invasion -> Strafe pro Vorfall
-          - Speed-Kontrolle, Distanz-Fortschritt, etc.
+          - LaneInvasion -> -0.2 pro Invasion
+          - Geschwindigkeits-Kontrolle
+          - Distanz-Fortschritt
+          - Spurhaltung (Lateral Offset)
+          - Heading Bonus
         """
-        # 1) Kollision
         if done and self.collision_occured:
             return -100.0
-
-        # 2) Ziel erreicht
         if reached_destination:
             return 100.0
-
-        # 3) Timeout
         if truncated:
             return -5.0
 
-        # 4) Normaler Step-Reward
         reward = 0.0
 
-        # 4a) Lane Invasion Strafe: z. B. -0.2 pro Invasion
-        #    -> lane_invasion_count wird in step() hochgezählt, also belohnen wir negative je event
+        # Lane Invasion Strafe
         if self.lane_invasion_count > 0:
             reward -= 0.2 * self.lane_invasion_count
-            # Wenn du möchtest, dass wir pro Step nur 1x zählen,
-            # kannst du hier self.lane_invasion_count = 0 wieder auf 0 setzen.
             self.lane_invasion_count = 0
 
-        # 4b) Speed-Kontrolle: wir wollen ~30 km/h
+        # Speed-Kontrolle (z.B. 30 km/h)
         speed = self.get_vehicle_speed() * 3.6
         v_target = 30.0
         diff = abs(speed - v_target)
-        if diff < 5.0:
-            reward += 0.3  # gut
-        elif diff < 10.0:
-            reward += 0.1  # OK
+        if diff < 5:
+            reward += 0.3
+        elif diff < 10:
+            reward += 0.1
         else:
-            reward -= 0.3  # zu schnell/zu langsam
+            reward -= 0.3
 
-        # 4c) Distanz-Fortschritt: +0.5, wenn wir uns nähern, -0.2, wenn wir uns entfernen
+        # Distanz-Fortschritt
         current_distance = self.get_distance_to_destination()
         if current_distance is not None:
             if self.previous_distance is not None:
@@ -429,26 +425,22 @@ class CarlaEnv(gym.Env):
                     reward -= 0.2
             self.previous_distance = current_distance
 
-        # 4d) Spurhaltung (lateral offset)
+        # Spurhaltung (lateral offset)
         _, lateral_offset = self.get_lane_center_and_offset()
         if abs(lateral_offset) < 0.3:
             reward += 0.3
         else:
             reward -= 0.3
 
-        # 4e) Bonus, wenn wir in einem "vernünftigen" Heading sind
+        # Heading
         r_heading = self._heading_bonus()
         reward += r_heading
 
-        # 4f) Reward-Clamp (optional, um extreme Werte zu vermeiden)
+        # Begrenzung (optional)
         reward = max(-10.0, min(10.0, reward))
-
         return reward
 
     def _heading_bonus(self):
-        """
-        Kleiner Heading-Bonus, z. B. +/- 0.2
-        """
         transform = self.vehicle.get_transform()
         yaw = math.radians(transform.rotation.yaw)
 
@@ -456,7 +448,6 @@ class CarlaEnv(gym.Env):
         waypoint = map_carla.get_waypoint(transform.location)
         if not waypoint:
             return 0.0
-
         next_waypoints = waypoint.next(2.0)
         if not next_waypoints:
             return 0.0
@@ -465,12 +456,10 @@ class CarlaEnv(gym.Env):
         wp_loc = next_wp.transform.location
         dx = wp_loc.x - transform.location.x
         dy = wp_loc.y - transform.location.y
-
         desired_yaw = math.atan2(dy, dx)
         epsilon = desired_yaw - yaw
         epsilon = (epsilon + math.pi) % (2 * math.pi) - math.pi
 
-        # Kleiner Bonus: je kleiner Epsilon
         if abs(epsilon) < 0.2:
             return 0.2
         elif abs(epsilon) < 0.5:
@@ -511,72 +500,66 @@ class CarlaEnv(gym.Env):
 
 
 # -----------------------------------------------------
-#   Hauptprogramm / Trainings-Loop
+#   Hauptprogramm
 # -----------------------------------------------------
 def main():
-    # 1) Environment erstellen
+    # 1) Environment
     env = CarlaEnv()
     env = Monitor(env)
 
     # 2) Vektor-Umgebung
     vec_env = DummyVecEnv([lambda: env])
-    vec_env = VecTransposeImage(vec_env)  # (B,H,W,C)->(B,C,H,W)
+    # (B, H, W, C) -> (B, C, H, W)
+    vec_env = VecTransposeImage(vec_env)
 
-    # 3) PPO-Konfiguration
-    #    Größere net_arch, wie in deinem verlinkten Repo
-    #    Zusätzlich: CustomCNN-Extractor, falls du es nutzen willst.
+    # 3) PPO-Konfiguration mit Custom CNN + größerer net_arch
     policy_kwargs = dict(
-        # Netzwerkkonfiguration (größeres MLP in Policy + Value Head)
         net_arch=[512, 256, 128],
-        # Optionaler, eigener CNN-Feature-Extraktor
         features_extractor_class=CustomCNNFeaturesExtractor,
         features_extractor_kwargs=dict(features_dim=256),
     )
 
     ppo_hyperparams = dict(
         n_steps=2048,
-        batch_size=128,  # Größerer Batch
+        batch_size=128,
         n_epochs=10,
         gamma=0.99,
-        learning_rate=1e-4,  # ggf. kleinere LR, da größeres Netz
+        learning_rate=1e-4,
         clip_range=0.2,
-        ent_coef=0.001,      # Du kannst ent_coef senken oder erhöhen
+        ent_coef=0.001,
         vf_coef=0.5,
         gae_lambda=0.95,
         max_grad_norm=0.5,
         verbose=1,
-        device="cuda",       # "cuda" wenn du eine GPU verwenden kannst
-        policy_kwargs=policy_kwargs
+        device="cuda",  # "cuda" falls PyTorch GPU-fähig
+        policy_kwargs=policy_kwargs,
     )
 
     # 4) PPO anlegen
     model = PPO(
-        policy="CnnPolicy",  # "CnnPolicy" wird durch unseren CustomExtractor überschrieben
+        policy="CnnPolicy",  # "CnnPolicy" -> wir überschreiben's mit CustomCNN
         env=vec_env,
         **ppo_hyperparams
     )
 
     # 5) Training
-    total_timesteps = 20_000
+    total_timesteps = 10_000  # kleiner Wert zum Testen
     model.learn(total_timesteps=total_timesteps)
 
     # 6) Modell speichern
     model.save("ppo_carla_model_large_net")
 
-    # Testepisode
+    # --- Testepisode ---
     print("Training abgeschlossen. Starte Testepisode ...")
-
     test_env = CarlaEnv()
     test_env = Monitor(test_env)
     test_env = DummyVecEnv([lambda: test_env])
     test_env = VecTransposeImage(test_env)
 
     obs, info = test_env.reset()
-
-    for _ in range(600):
+    for _ in range(300):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = test_env.step(action)
-
         if done or truncated:
             obs, info = test_env.reset()
 
