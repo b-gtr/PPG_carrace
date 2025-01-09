@@ -7,7 +7,7 @@ import time
 
 import carla
 
-# Gymnasium (nicht altes "gym")
+# Gymnasium statt altes "gym"
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -30,7 +30,7 @@ class Sensor:
         self.history.clear()
 
     def destroy(self):
-        if self.sensor is not None:
+        if self.sensor:
             try:
                 self.sensor.destroy()
             except RuntimeError as e:
@@ -100,7 +100,7 @@ class CameraSensor(Sensor):
 
 class CarlaEnv(gym.Env):
     """
-    Carla-Umgebung, kompatibel mit Gymnasium (>=0.26):
+    Gymnasium-Umgebung (>=0.26):
       - reset() -> (obs, info)
       - step() -> (obs, reward, done, truncated, info)
     """
@@ -108,12 +108,10 @@ class CarlaEnv(gym.Env):
     def __init__(self, render_mode=None):
         super(CarlaEnv, self).__init__()
 
-        # CARLA-Client
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
-
-        # Welt laden
         self.client.load_world('Town01')
+
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
         self.spawn_points = self.world.get_map().get_spawn_points()
@@ -140,10 +138,10 @@ class CarlaEnv(gym.Env):
         self.max_episode_steps = 300
         self.current_step = 0
 
-        # Action Space: [Steer, Throttle] in [-1, 1]
+        # Aktionen: [Steer, Throttle] in [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Observation Space: Bild (480x640x3)
+        # Beobachtung: 480x640-Bild in 3 Kanälen
         self.observation_shape = (480, 640, 3)
         self.observation_space = spaces.Box(
             low=0, high=255, shape=self.observation_shape, dtype=np.uint8
@@ -177,42 +175,34 @@ class CarlaEnv(gym.Env):
 
         self.setup_sensors()
 
+        # Beispielziel: 40 Meter geradeaus
         direction_vector = self.spawn_rotation.get_forward_vector()
         self.destination = self.spawn_point.location + direction_vector * 40
 
         self.current_step = 0
 
-        # Einige Ticks warten, damit erstes Bild ankommt
+        # Mehrere Ticks, damit erstes Bild ankommt
         for _ in range(5):
             self.world.tick()
 
     def setup_sensors(self):
         self.camera_sensor = CameraSensor(
-            self.vehicle,
-            self.blueprint_library,
-            self.world,
-            self.process_image
+            self.vehicle, self.blueprint_library, self.world, self.process_image
         )
         self.camera_sensor.listen()
 
         self.collision_sensor = CollisionSensor(
-            self.vehicle,
-            self.blueprint_library,
-            self.world
+            self.vehicle, self.blueprint_library, self.world
         )
         self.collision_sensor.listen()
 
         self.lane_invasion_sensor = LaneInvasionSensor(
-            self.vehicle,
-            self.blueprint_library,
-            self.world
+            self.vehicle, self.blueprint_library, self.world
         )
         self.lane_invasion_sensor.listen()
 
         self.gnss_sensor = GnssSensor(
-            self.vehicle,
-            self.blueprint_library,
-            self.world
+            self.vehicle, self.blueprint_library, self.world
         )
         self.gnss_sensor.listen()
 
@@ -291,7 +281,8 @@ class CarlaEnv(gym.Env):
 
         # Heading
         transform = self.vehicle.get_transform()
-        yaw = math.radians(transform.rotation.yaw)
+        rotation = transform.rotation
+        yaw = math.radians(rotation.yaw)
 
         map_carla = self.world.get_map()
         waypoint = map_carla.get_waypoint(transform.location)
@@ -314,7 +305,7 @@ class CarlaEnv(gym.Env):
         return total_reward
 
     def step(self, action):
-        # Gymnasium: step() -> (obs, reward, done, truncated, info)
+        # Gymnasium: step -> (obs, reward, done, truncated, info)
         self.current_step += 1
 
         steer = float(action[0])
@@ -339,10 +330,8 @@ class CarlaEnv(gym.Env):
         done = False
         truncated = False
 
-        # done, wenn Kollision
         if self.collision_occured:
             done = True
-        # oder wenn maximale Schritte
         elif self.current_step >= self.max_episode_steps:
             truncated = True
 
@@ -355,13 +344,12 @@ class CarlaEnv(gym.Env):
         with self.image_lock:
             if self.agent_image is None:
                 return np.zeros(self.observation_shape, dtype=np.uint8)
-            obs = self.agent_image.astype(np.uint8)
-        return obs
+            return self.agent_image.astype(np.uint8)
 
     def reset(self, seed=None, options=None):
         """
-        Gymnasium reset-Signatur: 
-          -> (obs, info)
+        Gymnasium reset-Signatur:
+        Muss (obs, info) zurückgeben.
         """
         super().reset(seed=seed)
         self.reset_environment()
@@ -389,12 +377,14 @@ class CarlaEnv(gym.Env):
 
 
 def main():
+    # Environment erstellen
     env = CarlaEnv()
     env = Monitor(env)
 
     vec_env = DummyVecEnv([lambda: env])
     vec_env = VecTransposeImage(vec_env)
 
+    # PPO-Parameter
     ppo_hyperparams = dict(
         n_steps=2048,
         batch_size=64,
@@ -407,14 +397,18 @@ def main():
         gae_lambda=0.95,
         max_grad_norm=0.5,
         verbose=1,
-        device="cuda",  # Nur wenn PyTorch mit CUDA installiert
+        device="cuda",  # optional GPU, falls PyTorch CUDA-fähig
     )
 
-    model = PPO("CnnPolicy", env=vec_env, **ppo_hyperparams)
+    # PPO-Modell
+    model = PPO(
+        policy="CnnPolicy",
+        env=vec_env,
+        **ppo_hyperparams
+    )
 
     total_timesteps = 10_000
     model.learn(total_timesteps=total_timesteps)
-
     model.save("ppo_carla_model_gpu")
 
     # --- Test-Episode ---
