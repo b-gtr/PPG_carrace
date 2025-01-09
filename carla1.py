@@ -7,7 +7,7 @@ import time
 
 import carla
 
-# Gymnasium statt altes "gym"
+# Gymnasium (nicht das alte "gym")
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -103,6 +103,11 @@ class CarlaEnv(gym.Env):
     Gymnasium-Umgebung (>=0.26):
       - reset() -> (obs, info)
       - step() -> (obs, reward, done, truncated, info)
+
+    Reward-Struktur:
+      - Meistens Werte im Bereich -1..+1
+      - Kollision -> -5 (größerer negativer Wert)
+      - Ziel erreicht -> +5 (größerer positiver Wert)
     """
 
     def __init__(self, render_mode=None):
@@ -135,6 +140,7 @@ class CarlaEnv(gym.Env):
         self.latest_image = None
         self.agent_image = None
 
+        # Episodenbegrenzung
         self.max_episode_steps = 300
         self.current_step = 0
 
@@ -147,10 +153,15 @@ class CarlaEnv(gym.Env):
             low=0, high=255, shape=self.observation_shape, dtype=np.uint8
         )
 
+        # Spawn / Ziel
         self.spawn_point = None
         self.spawn_rotation = None
         self.destination = None
         self.collision_occured = False
+
+        # Distanz-Messung
+        self.previous_distance = None
+        self.distance_threshold = 3.0  # Wenn man näher als 3m am Ziel ist, gilt "Ziel erreicht"
 
         self.reset_environment()
 
@@ -175,13 +186,14 @@ class CarlaEnv(gym.Env):
 
         self.setup_sensors()
 
-        # Beispielziel: 40 Meter geradeaus
+        # Ziel: 40 Meter geradeaus
         direction_vector = self.spawn_rotation.get_forward_vector()
         self.destination = self.spawn_point.location + direction_vector * 40
 
         self.current_step = 0
+        self.previous_distance = None
 
-        # Mehrere Ticks, damit erstes Bild ankommt
+        # Ein paar Ticks warten für erstes Bild
         for _ in range(5):
             self.world.tick()
 
@@ -259,58 +271,22 @@ class CarlaEnv(gym.Env):
         lateral_offset = dx * perpendicular_direction.x + dy * perpendicular_direction.y
         return lane_center, lateral_offset
 
-    def _compute_reward(self, done, step):
-        if done and self.collision_occured:
-            return -30.0
-
-        deviation_threshold = 0.7
-        deviation_penalty_scale = 4.0
-
-        speed = self.get_vehicle_speed() * 3.6
-        _, lateral_offset = self.get_lane_center_and_offset()
-
-        # Lane-Kontrolle
-        if abs(lateral_offset) <= deviation_threshold:
-            r_lane_centering = 1.0 / (abs(lateral_offset) + 0.1)
-        else:
-            r_lane_centering = -deviation_penalty_scale * (abs(lateral_offset) - deviation_threshold)
-
-        # Speed-Kontrolle
-        v_target = 20
-        r_speed = 1 - min(1, abs(speed - v_target) / 5)
-
-        # Heading
-        transform = self.vehicle.get_transform()
-        rotation = transform.rotation
-        yaw = math.radians(rotation.yaw)
-
-        map_carla = self.world.get_map()
-        waypoint = map_carla.get_waypoint(transform.location)
-        next_waypoints = waypoint.next(2.0) if waypoint else []
-        if next_waypoints:
-            next_waypoint = next_waypoints[0]
-            wp_location = next_waypoint.transform.location
-            dx = wp_location.x - transform.location.x
-            dy = wp_location.y - transform.location.y
-            desired_yaw = math.atan2(dy, dx)
-            epsilon = desired_yaw - yaw
-            epsilon = (epsilon + math.pi) % (2 * math.pi) - math.pi
-            r_heading = -(abs(epsilon) / 3) ** 2
-        else:
-            r_heading = 0.0
-
-        r_overspeed = -5 if speed > 25 else 0
-
-        total_reward = r_lane_centering + r_speed + r_heading + r_overspeed
-        return total_reward
+    def get_distance_to_destination(self):
+        if self.destination is None:
+            return None
+        vehicle_location = self.vehicle.get_transform().location
+        return vehicle_location.distance(self.destination)
 
     def step(self, action):
-        # Gymnasium: step -> (obs, reward, done, truncated, info)
+        """
+        Gymnasium: step -> (obs, reward, done, truncated, info)
+        """
         self.current_step += 1
 
         steer = float(action[0])
         throttle = float(action[1])
 
+        # Steering / Throttle anpassen
         steer_scaled = np.clip(steer / 2.0, -1.0, 1.0)
         throttle_scaled = np.clip(0.5 * (1 + throttle), 0.0, 1.0)
 
@@ -327,18 +303,134 @@ class CarlaEnv(gym.Env):
 
         obs = self._get_observation()
 
+        # Check terminal conditions
         done = False
         truncated = False
 
+        # Kollision -> Ende
         if self.collision_occured:
             done = True
+
+        # Zeit/Schritte abgelaufen
         elif self.current_step >= self.max_episode_steps:
             truncated = True
 
-        reward = self._compute_reward(done, self.current_step)
+        # Check, ob wir das Ziel erreicht haben (Abstand < threshold => Belohnung, done = True)
+        distance = self.get_distance_to_destination()
+        reached_destination = False
+        if distance is not None and distance < self.distance_threshold:
+            # Ziel erreicht => Extra-Reward + Ende
+            reached_destination = True
+            done = True
 
+        reward = self._compute_reward(done, truncated, reached_destination)
         info = {}
+
         return obs, reward, done, truncated, info
+
+    def _compute_reward(self, done, truncated, reached_destination):
+        """
+        Rewardskalierung:
+          - Normale Rewards zwischen -1 und +1
+          - Bei Kollision -> -5
+          - Bei Zielerreichung -> +5
+        """
+        # 1) Kollision
+        if done and self.collision_occured:
+            return -5.0
+
+        # 2) Ziel erreicht
+        if reached_destination:
+            return 5.0
+
+        # 3) Timeout
+        if truncated:
+            return -1.0
+
+        # 4) Normaler Step-Reward
+        total_reward = 0.0
+
+        # 4a) Lane-Kontrolle in [-0.5..+0.5]
+        _, lateral_offset = self.get_lane_center_and_offset()
+        deviation_threshold = 0.7  # ab hier Strafe
+        if abs(lateral_offset) < 0.1:
+            # sehr gut in der Spur -> +0.5
+            r_lane = 0.5
+        elif abs(lateral_offset) < deviation_threshold:
+            # mittel -> +0.2
+            r_lane = 0.2
+        else:
+            # stark abgewichen -> -0.5
+            r_lane = -0.5
+        total_reward += r_lane
+
+        # 4b) Speed-Kontrolle in [-0.5..+0.5]
+        speed = self.get_vehicle_speed() * 3.6
+        v_target = 20.0
+        speed_diff = abs(speed - v_target)
+        if speed_diff < 2:
+            # sehr nah an 20 => +0.5
+            r_speed = 0.5
+        elif speed_diff < 5:
+            # okay => +0.2
+            r_speed = 0.2
+        else:
+            # zu schnell/zu langsam => -0.5
+            r_speed = -0.5
+        total_reward += r_speed
+
+        # 4c) Distanz-Fortschritt: +0.2, wenn wir uns nähern, -0.1, wenn wir uns entfernen
+        current_distance = self.get_distance_to_destination()
+        if current_distance is not None:
+            if self.previous_distance is None:
+                # Erstes Step => kein Fortschritt
+                r_distance = 0.0
+            else:
+                if current_distance < self.previous_distance:
+                    r_distance = 0.2
+                else:
+                    r_distance = -0.1
+            self.previous_distance = current_distance
+            total_reward += r_distance
+
+        # 4d) Heading / Wegpunkte in [-0.2..+0.2]
+        r_heading = self._heading_reward()
+        total_reward += r_heading
+
+        # 4e) Begrenzung, dass Reward maximal ~1 oder minimal ~-1 (außer Kollision/Ziel/Timeout)
+        total_reward = max(-1.0, min(1.0, total_reward))
+
+        return total_reward
+
+    def _heading_reward(self):
+        # Heading in [-0.2..+0.2]
+        transform = self.vehicle.get_transform()
+        yaw = math.radians(transform.rotation.yaw)
+
+        map_carla = self.world.get_map()
+        waypoint = map_carla.get_waypoint(transform.location)
+        if waypoint:
+            next_waypoints = waypoint.next(2.0)
+        else:
+            next_waypoints = []
+
+        if next_waypoints:
+            next_wp = next_waypoints[0]
+            wp_loc = next_wp.transform.location
+            dx = wp_loc.x - transform.location.x
+            dy = wp_loc.y - transform.location.y
+            desired_yaw = math.atan2(dy, dx)
+            epsilon = desired_yaw - yaw
+            epsilon = (epsilon + math.pi) % (2 * math.pi) - math.pi
+            # kleine Abweichung => besserer Reward
+            if abs(epsilon) < 0.1:
+                return 0.2
+            elif abs(epsilon) < 0.3:
+                return 0.1
+            else:
+                return -0.2
+        else:
+            return 0.0
 
     def _get_observation(self):
         with self.image_lock:
@@ -349,7 +441,7 @@ class CarlaEnv(gym.Env):
     def reset(self, seed=None, options=None):
         """
         Gymnasium reset-Signatur:
-        Muss (obs, info) zurückgeben.
+        -> (obs, info)
         """
         super().reset(seed=seed)
         self.reset_environment()
@@ -381,12 +473,13 @@ def main():
     env = CarlaEnv()
     env = Monitor(env)
 
+    # Vektor-Umgebung für SB3
     vec_env = DummyVecEnv([lambda: env])
     vec_env = VecTransposeImage(vec_env)
 
     # PPO-Parameter
     ppo_hyperparams = dict(
-        n_steps=2048,
+        n_steps=1024,
         batch_size=64,
         n_epochs=10,
         gamma=0.99,
@@ -397,10 +490,9 @@ def main():
         gae_lambda=0.95,
         max_grad_norm=0.5,
         verbose=1,
-        device="cuda",  # optional GPU, falls PyTorch CUDA-fähig
+        device="cuda",  # Falls PyTorch mit CUDA installiert
     )
 
-    # PPO-Modell
     model = PPO(
         policy="CnnPolicy",
         env=vec_env,
@@ -409,22 +501,23 @@ def main():
 
     total_timesteps = 10_000
     model.learn(total_timesteps=total_timesteps)
-    model.save("ppo_carla_model_gpu")
+    model.save("ppo_carla_model_small_rewards")
 
-    # --- Test-Episode ---
+    # Test-Episode
     print("Training abgeschlossen. Starte Testepisode ...")
     test_env = CarlaEnv()
     test_env = Monitor(test_env)
     test_env = DummyVecEnv([lambda: test_env])
     test_env = VecTransposeImage(test_env)
 
-    # Gymnasium-Style: reset() -> (obs, info)
+    # Da Gymnasium: reset() -> (obs, info)
     obs, info = test_env.reset()
 
     for _ in range(300):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = test_env.step(action)
 
+        # Optional: test_env.render() oder logging
         if done or truncated:
             obs, info = test_env.reset()
 
