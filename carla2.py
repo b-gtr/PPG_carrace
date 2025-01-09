@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# <dfs_fixed.py>
+
 import os
 import math
 import threading
@@ -108,24 +111,24 @@ class CameraSensor(Sensor):
 
 # -----------------------------------------------------
 #   Custom CNN Features Extractor
-#   -> Behebt das Kernel-Größenproblem, indem wir
-#      die Dimensionen richtig aus observation_space.shape auslesen.
 # -----------------------------------------------------
 class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
+    """
+    NOTE: After using VecTransposeImage, the observation shape is (C, H, W).
+    For a semantic segmentation camera, we expect C=3, H=600, W=800.
+    """
+
     def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
-        """
-        observation_space.shape = (600, 800, 3)  # (H, W, C)
-        Nach VecTransposeImage sieht PyTorch-Eingabe wie (B, C=3, H=600, W=800) aus.
-        """
         super().__init__(observation_space, features_dim)
 
-        # Entpacken
-        h, w, c = observation_space.shape  # z.B. 600, 800, 3
-        n_input_channels = c  # 3
-        height = h            # 600
-        width = w             # 800
+        # SB3 (with VecTransposeImage) passes shape as (C, H, W)
+        c, h, w = observation_space.shape
 
-        # Beispiel-CNN ähnlich wie in deinem Repo
+        n_input_channels = c  # Typically 3
+        height = h            # Typically 600
+        width = w             # Typically 800
+
+        # Example CNN
         self.cnn = nn.Sequential(
             nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -136,19 +139,19 @@ class CustomCNNFeaturesExtractor(BaseFeaturesExtractor):
             nn.Flatten(),
         )
 
-        # Dummy Forward-Pass zum Dim-Bestimmen
+        # Determine n_flatten by doing a dummy forward pass
         with torch.no_grad():
             dummy_input = torch.zeros((1, n_input_channels, height, width), dtype=torch.float32)
             n_flatten = self.cnn(dummy_input).shape[1]
 
-        # Lineares Mapping
+        # Linear layers on flattened CNN output
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
         )
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # observations: (B, C=3, H=600, W=800)
+        # observations shape: (B, C=3, H=600, W=800)
         x = self.cnn(observations)
         return self.linear(x)
 
@@ -165,7 +168,7 @@ class CarlaEnv(gym.Env):
     def __init__(self, render_mode=None):
         super(CarlaEnv, self).__init__()
 
-        # Carla initialisieren
+        # Carla init
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
         self.client.load_world('Town01')
@@ -182,17 +185,17 @@ class CarlaEnv(gym.Env):
         self.image_lock = threading.Lock()
         self.running = True
 
-        # Synchroner Modus
+        # Enable synchronous mode
         self.original_settings = self.world.get_settings()
         settings = self.world.get_settings()
         settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.05  # 20 FPS
+        settings.fixed_delta_seconds = 0.05  # ~20 FPS
         self.world.apply_settings(settings)
 
         self.latest_image = None
         self.agent_image = None
 
-        # Episodengröße
+        # Max steps per episode
         self.max_episode_steps = 600
         self.current_step = 0
 
@@ -205,17 +208,18 @@ class CarlaEnv(gym.Env):
             low=0, high=255, shape=self.observation_shape, dtype=np.uint8
         )
 
-        # Zieldefinition
+        # Goal & collision flags
         self.spawn_point = None
         self.spawn_rotation = None
         self.destination = None
         self.collision_occured = False
         self.lane_invasion_count = 0
 
-        # Distanz
+        # Distance threshold
         self.previous_distance = None
         self.distance_threshold = 3.0
 
+        # Initialize environment
         self.reset_environment()
 
     def reset_environment(self):
@@ -232,7 +236,7 @@ class CarlaEnv(gym.Env):
         self.lane_invasion_count = 0
         self.previous_distance = None
 
-        # Starte z. B. random, oder immer self.spawn_points[0]
+        # Pick a random spawn point
         self.spawn_point = random.choice(self.spawn_points)
         self.spawn_rotation = self.spawn_point.rotation
 
@@ -241,12 +245,13 @@ class CarlaEnv(gym.Env):
 
         self.setup_sensors()
 
-        # z. B. 60 Meter geradeaus
+        # e.g., 60 meters forward
         direction_vector = self.spawn_rotation.get_forward_vector()
         self.destination = self.spawn_point.location + direction_vector * 60
 
         self.current_step = 0
 
+        # Let the world tick a few times
         for _ in range(5):
             self.world.tick()
 
@@ -291,10 +296,13 @@ class CarlaEnv(gym.Env):
         self.agent_image = None
 
     def process_image(self, image):
-        # Semantic Segmentation
+        # Convert semantic segmentation image to raw
         image.convert(carla.ColorConverter.Raw)
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = array.reshape((image.height, image.width, 4))
+
+        # Because we used ColorConverter.Raw, array[..., 2] effectively
+        # holds semantic segmentation IDs, but let's keep it simple
         labels = array[:, :, 2]
 
         with self.image_lock:
@@ -337,7 +345,7 @@ class CarlaEnv(gym.Env):
         steer = float(action[0])
         throttle = float(action[1])
 
-        # Steering / Throttle
+        # Scale steering and throttle
         steer_scaled = np.clip(steer / 2.0, -1.0, 1.0)
         throttle_scaled = np.clip(0.5 * (1 + throttle), 0.0, 1.0)
 
@@ -349,7 +357,7 @@ class CarlaEnv(gym.Env):
 
         self.world.tick()
 
-        # Sensors
+        # Check sensors
         if len(self.collision_sensor.get_history()) > 0:
             self.collision_occured = True
         if len(self.lane_invasion_sensor.get_history()) > 0:
@@ -361,7 +369,7 @@ class CarlaEnv(gym.Env):
         done = False
         truncated = False
 
-        # Kollision => done
+        # Check termination conditions
         if self.collision_occured:
             done = True
         elif self.current_step >= self.max_episode_steps:
@@ -399,12 +407,12 @@ class CarlaEnv(gym.Env):
 
         reward = 0.0
 
-        # Lane Invasion Strafe
+        # Lane Invasion penalty
         if self.lane_invasion_count > 0:
             reward -= 0.2 * self.lane_invasion_count
             self.lane_invasion_count = 0
 
-        # Speed-Kontrolle (z.B. 30 km/h)
+        # Speed control around 30 km/h
         speed = self.get_vehicle_speed() * 3.6
         v_target = 30.0
         diff = abs(speed - v_target)
@@ -415,7 +423,7 @@ class CarlaEnv(gym.Env):
         else:
             reward -= 0.3
 
-        # Distanz-Fortschritt
+        # Distance progress
         current_distance = self.get_distance_to_destination()
         if current_distance is not None:
             if self.previous_distance is not None:
@@ -425,18 +433,18 @@ class CarlaEnv(gym.Env):
                     reward -= 0.2
             self.previous_distance = current_distance
 
-        # Spurhaltung (lateral offset)
+        # Lateral offset
         _, lateral_offset = self.get_lane_center_and_offset()
         if abs(lateral_offset) < 0.3:
             reward += 0.3
         else:
             reward -= 0.3
 
-        # Heading
+        # Heading bonus
         r_heading = self._heading_bonus()
         reward += r_heading
 
-        # Begrenzung (optional)
+        # Optional clamp
         reward = max(-10.0, min(10.0, reward))
         return reward
 
@@ -531,25 +539,25 @@ def main():
         gae_lambda=0.95,
         max_grad_norm=0.5,
         verbose=1,
-        device="cuda",  # "cuda" falls PyTorch GPU-fähig
+        device="cuda",  # "cuda" if GPU is available
         policy_kwargs=policy_kwargs,
     )
 
     # 4) PPO anlegen
     model = PPO(
-        policy="CnnPolicy",  # "CnnPolicy" -> wir überschreiben's mit CustomCNN
+        policy="CnnPolicy", 
         env=vec_env,
         **ppo_hyperparams
     )
 
     # 5) Training
-    total_timesteps = 10_000  # kleiner Wert zum Testen
+    total_timesteps = 10_000  # Example small training steps for testing
     model.learn(total_timesteps=total_timesteps)
 
-    # 6) Modell speichern
+    # 6) Save model
     model.save("ppo_carla_model_large_net")
 
-    # --- Testepisode ---
+    # --- Test episode ---
     print("Training abgeschlossen. Starte Testepisode ...")
     test_env = CarlaEnv()
     test_env = Monitor(test_env)
