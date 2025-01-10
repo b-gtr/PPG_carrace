@@ -13,13 +13,16 @@ from gymnasium import spaces
 
 # Stable Baselines3
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecTransposeImage
+)
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 import torch
 import torch.nn as nn
-
 
 # -----------------------------------------------------
 #   Sensor-Klassen
@@ -105,7 +108,6 @@ class CameraSensor(Sensor):
     def listen(self):
         self.sensor.listen(self.image_processor_callback)
 
-
 # -----------------------------------------------------
 #   Custom CNN Features Extractor
 # -----------------------------------------------------
@@ -157,11 +159,11 @@ class CarlaEnv(gym.Env):
         nur Strafe - außer man ist sehr weit von der Fahrbahn.
     """
 
-    def __init__(self, render_mode=None):
+    def __init__(self, host='localhost', port=2000, render_mode=None):
         super(CarlaEnv, self).__init__()
 
         # Carla init
-        self.client = carla.Client('localhost', 2000)
+        self.client = carla.Client(host, port)
         self.client.set_timeout(10.0)
         self.client.load_world('Town01')
         self.world = self.client.get_world()
@@ -221,6 +223,11 @@ class CarlaEnv(gym.Env):
         self.reset_environment()
 
     def reset_environment(self):
+        """
+        Versucht mehrfach, das Fahrzeug zu spawnen. Falls es
+        aufgrund einer Kollision beim Spawn nicht klappt,
+        wird ein neuer random Spawnpunkt ausprobiert.
+        """
         self._clear_sensors()
 
         if self.vehicle is not None:
@@ -234,20 +241,36 @@ class CarlaEnv(gym.Env):
         self.lane_invasion_count = 0
         self.previous_distance = None
 
-        # Zufälliger Spawn-Punkt
-        self.spawn_point = random.choice(self.spawn_points)
-        self.spawn_rotation = self.spawn_point.rotation
-
         vehicle_bp = self.blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
-        self.vehicle = self.world.spawn_actor(vehicle_bp, self.spawn_point)
 
+        # Maximal 10 Versuche, einen geeigneten Spawn-Punkt zu finden
+        max_attempts = 10
+        self.spawn_point = None
+        for attempt in range(max_attempts):
+            candidate = random.choice(self.spawn_points)
+            try:
+                self.vehicle = self.world.spawn_actor(vehicle_bp, candidate)
+                self.spawn_point = candidate
+                self.spawn_rotation = candidate.rotation
+                # Wenn Spawnen geklappt hat, direkt raus aus der Schleife
+                break
+            except RuntimeError as e:
+                print(f"[WARN] Spawn attempt {attempt + 1}/{max_attempts} failed: {e}")
+                self.vehicle = None
+                continue
+
+        # Falls alle Versuche fehlgeschlagen sind
+        if self.vehicle is None:
+            raise RuntimeError("Could not spawn a vehicle after several attempts.")
+
+        # Sensoren einrichten
         self.setup_sensors()
 
         # Beispiel: Ziel 60m in Fahrtrichtung
         direction_vector = self.spawn_rotation.get_forward_vector()
         self.destination = self.spawn_point.location + direction_vector * 60
 
-        # Route mit Waypoints (alle 2m) erstellen (ohne Endlosschleife)
+        # Route mit Waypoints erstellen
         self._generate_route()
 
         self.current_step = 0
@@ -283,7 +306,7 @@ class CarlaEnv(gym.Env):
                 # Keine weiteren Waypoints
                 break
 
-            # Nimm den ersten Vorschlag (alternativ könnte man hier den "besten" wählen)
+            # Nimm den ersten Vorschlag
             next_wp = next_wps[0]
             dist = next_wp.transform.location.distance(self.destination)
 
@@ -476,7 +499,7 @@ class CarlaEnv(gym.Env):
             reward -= 0.2 * self.lane_invasion_count
             self.lane_invasion_count = 0
 
-        # Geschwindigkeits-Kontrolle
+        # Geschwindigkeits-Kontrolle (Ziel: 30 km/h)
         speed = self.get_vehicle_speed() * 3.6  # m/s -> km/h
         v_target = 30.0
         diff = abs(speed - v_target)
@@ -497,7 +520,7 @@ class CarlaEnv(gym.Env):
                     reward -= 0.2
             self.previous_distance = current_distance
 
-        # Lateral Offset-Strafe, solange man nicht offroad (> 3.0) ist
+        # Lateral Offset-Strafe (solange man nicht offroad > 3.0)
         _, lateral_offset = self.get_lane_center_and_offset()
         if abs(lateral_offset) < 0.3:
             reward += 0.3
@@ -531,6 +554,7 @@ class CarlaEnv(gym.Env):
         dy = wp_loc.y - transform.location.y
         desired_yaw = math.atan2(dy, dx)
         epsilon = desired_yaw - yaw
+        # "Normiere" epsilon in [-pi, pi]
         epsilon = (epsilon + math.pi) % (2 * math.pi) - math.pi
 
         if abs(epsilon) < 0.2:
@@ -571,21 +595,32 @@ class CarlaEnv(gym.Env):
         if self.vehicle:
             self.vehicle.destroy()
 
-
 # -----------------------------------------------------
-#   Hauptprogramm
+#   Hauptprogramm - Mehrere Agents gleichzeitig
 # -----------------------------------------------------
 def main():
-    # 1) Environment
-    env = CarlaEnv()
-    env = Monitor(env)
+    """
+    Beispiel, um mehrere CarlaEnv-Instanzen parallel zu starten.
+    Wir starten hier 3 Environments (=3 Agents).
+    Achtung: Alle nutzen den gleichen Port 2000.
+    """
+    num_envs = 3  # z.B. 3 Agents
 
-    # 2) Vektor-Umgebung
-    vec_env = DummyVecEnv([lambda: env])
+    def make_env():
+        def _init():
+            env = CarlaEnv(host='localhost', port=2000)
+            env = Monitor(env)
+            return env
+        return _init
+
+    env_fns = [make_env() for _ in range(num_envs)]
+
+    # Parallelisierung per SubprocVecEnv
+    vec_env = SubprocVecEnv(env_fns)
     # (B, H, W, C) -> (B, C, H, W)
     vec_env = VecTransposeImage(vec_env)
 
-    # 3) PPO-Konfiguration mit Custom CNN + größerer net_arch
+    # PPO-Konfiguration mit Custom CNN
     policy_kwargs = dict(
         net_arch=[512, 256, 128],
         features_extractor_class=CustomCNNFeaturesExtractor,
@@ -608,22 +643,23 @@ def main():
         policy_kwargs=policy_kwargs,
     )
 
-    # 4) PPO anlegen
+    # PPO anlegen
     model = PPO(
         policy="CnnPolicy",
         env=vec_env,
         **ppo_hyperparams
     )
 
-    # 5) Training
-    total_timesteps = 10_000  # Beispielhafter kleiner Wert zum Testen
+    # Training
+    total_timesteps = 10_000  # Beispielhafter kleiner Wert
     model.learn(total_timesteps=total_timesteps)
 
-    # 6) Model speichern
-    model.save("ppo_carla_model_large_net")
+    # Model speichern
+    model.save("ppo_carla_model_large_net_multiagent_retry")
 
-    # --- Testepisode ---
+    # --- Testepisode (nur 1 Env, hier Dummy) ---
     print("Training abgeschlossen. Starte Testepisode ...")
+
     test_env = CarlaEnv()
     test_env = Monitor(test_env)
     test_env = DummyVecEnv([lambda: test_env])
@@ -637,7 +673,6 @@ def main():
             obs, info = test_env.reset()
 
     test_env.close()
-
 
 if __name__ == "__main__":
     main()
