@@ -1,99 +1,56 @@
-# ppo.py
 import gymnasium as gym
 import torch
-
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
-
-# sb3-contrib provides RecurrentPPO and CnnLstmPolicy
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from sb3_contrib import RecurrentPPO
 from sb3_contrib.ppo_recurrent.policies import CnnLstmPolicy
 
-# For learning rate scheduling
-from stable_baselines3.common.utils import get_linear_fn
+# For optional logging
+# from stable_baselines3.common.logger import configure
 
-
-def train_cnn_policy(total_timesteps=200_000, n_envs=8):
+def make_env():
     """
-    Train a standard PPO with a CNN policy on CarRacing-v3 using:
-      - Multiple parallel environments
-      - A linear learning rate schedule
-      - Tuned hyperparameters
+    Helper function to create the CarRacing environment.
+    Wrap it in a DummyVecEnv for vectorized training.
     """
-    print("Training PPO with CnnPolicy on CarRacing-v3...")
+    return gym.make("CarRacing-v3", continuous=True)
 
-    # Create multiple parallel environments for faster sampling
-    env = make_vec_env(
-        env_id="CarRacing-v3",
-        n_envs=n_envs,
-        env_kwargs={"continuous": True},
-        vec_env_cls=SubprocVecEnv,
-    )
-
-    # Linear schedule from 3e-4 down to 1e-5 over total_timesteps
-    initial_lr = 3e-4
-    final_lr = 1e-5
-    lr_schedule = get_linear_fn(initial_value=initial_lr, final_value=final_lr, max_progress=1.0)
-
-    # Create the PPO model with a built-in CNN policy and improved hyperparameters
-    model_cnn = PPO(
-        policy="CnnPolicy",
-        env=env,
-        learning_rate=lr_schedule,
-        n_steps=1024,       # More steps per rollout helps with training stability
-        batch_size=64,      # Reasonable batch size for CNN-based policy
-        ent_coef=0.01,      # Encourage exploration
-        gamma=0.99,         # Discount factor
-        gae_lambda=0.95,    # GAE parameter
-        clip_range=0.2,     # PPO clipping
-        verbose=1,
-        tensorboard_log="./ppo_cnn_tensorboard/"  # Optional: for TensorBoard logs
-    )
-
-    # Train the model
-    model_cnn.learn(total_timesteps=total_timesteps)
-
-    # Save the model
-    model_cnn.save("ppo_cnn_car_racing")
-    print("Finished training PPO CNN. Model saved as ppo_cnn_car_racing.zip")
-
-
-def train_lstm_policy(total_timesteps=200_000, n_envs=8):
+def train_cnn_lstm_policy(total_timesteps=200_000):
     """
-    Train a RecurrentPPO (sb3-contrib) with a CNN + LSTM policy on CarRacing-v3 using:
-      - Multiple parallel environments
-      - A linear learning rate schedule
-      - Tuned hyperparameters
+    Train a RecurrentPPO model with a CNN + LSTM policy on CarRacing-v3.
+    The combination is obs -> CNN -> LSTM -> action.
     """
     print("Training RecurrentPPO with CnnLstmPolicy on CarRacing-v3...")
 
-    # Create multiple parallel environments for faster sampling
-    env = make_vec_env(
-        env_id="CarRacing-v3",
-        n_envs=n_envs,
-        env_kwargs={"continuous": True},
-        vec_env_cls=SubprocVecEnv,
-    )
+    # Create environment and wrap it
+    env = DummyVecEnv([make_env])
+    # Transpose images from (H, W, C) to (C, H, W) for PyTorch
+    env = VecTransposeImage(env)
 
-    # Linear schedule from 3e-4 down to 1e-5 over total_timesteps
-    initial_lr = 3e-4
-    final_lr = 1e-5
-    lr_schedule = get_linear_fn(initial_value=initial_lr, final_value=final_lr, max_progress=1.0)
+    # Optional: set up logging directory
+    # logger = configure("./logs/", ["stdout", "csv", "tensorboard"])
 
-    # Create the RecurrentPPO model with a CNN + LSTM policy and improved hyperparameters
+    # Hyperparameters based on common usage/examples
     model_lstm = RecurrentPPO(
         policy=CnnLstmPolicy,
         env=env,
-        learning_rate=lr_schedule,
-        n_steps=1024,
-        batch_size=64,
-        ent_coef=0.01,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
         verbose=1,
-        tensorboard_log="./recurrent_ppo_tensorboard/"
+        learning_rate=3e-4,
+        n_steps=128,            # how many steps to run per environment per update
+        batch_size=64,         # mini-batch size (must be a divisor of n_steps * n_envs)
+        n_epochs=10,           # number of optimization epochs per update
+        gamma=0.99,            # discount factor
+        gae_lambda=0.95,       # GAE parameter
+        clip_range=0.2,        
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        policy_kwargs=dict(
+            # If you want to configure the CNN or LSTM size, do so here:
+            # e.g. features_extractor_kwargs={"features_dim": 256},
+            lstm_hidden_size=256,
+            n_lstm_layers=1
+        ),
+        # tensorboard_log="./tensorboard/", # enable if you want tensorboard logs
     )
 
     # Train the model
@@ -101,10 +58,8 @@ def train_lstm_policy(total_timesteps=200_000, n_envs=8):
 
     # Save the model
     model_lstm.save("ppo_lstm_car_racing")
-    print("Finished training Recurrent PPO LSTM. Model saved as ppo_lstm_car_racing.zip")
-
+    print("Finished training. Model saved as ppo_lstm_car_racing.zip")
 
 if __name__ == "__main__":
-    # Example: train each policy for 200k timesteps using 8 parallel environments
-    train_cnn_policy(total_timesteps=200_000, n_envs=8)
-    train_lstm_policy(total_timesteps=200_000, n_envs=8)
+    # Example: train for 200k timesteps
+    train_cnn_lstm_policy(total_timesteps=200_000)
