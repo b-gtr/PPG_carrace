@@ -1,0 +1,468 @@
+import gym
+from gym import spaces
+import numpy as np
+import math
+import random
+import carla
+import threading
+import json
+
+# ---------------------------------
+# Helper Functions
+# ---------------------------------
+def vector_2d(vec_carla):
+    """Convert carla.Vector3D -> (x, y) in float."""
+    return np.array([vec_carla.x, vec_carla.y], dtype=np.float32)
+
+def distance_2d(a, b):
+    """Euclidean 2D distance."""
+    return float(np.linalg.norm(a - b))
+
+def clamp(value, min_val, max_val):
+    return max(min_val, min(value, max_val))
+
+def compute_lateral_offset(vehicle_transform, waypoint_transform):
+    """
+    Computes the lateral (sideways) distance of the vehicle from the center of the lane,
+    ignoring z-axis differences.
+    """
+    veh_loc = vehicle_transform.location
+    wp_loc = waypoint_transform.location
+
+    dx = veh_loc.x - wp_loc.x
+    dy = veh_loc.y - wp_loc.y
+
+    forward = waypoint_transform.get_forward_vector()
+    fx, fy = forward.x, forward.y
+
+    # 2D cross product: dx*fy - dy*fx
+    cross_val = dx * fy - dy * fx
+    return cross_val  # may be positive or negative
+
+def is_waypoint_behind(vehicle_transform, waypoint_transform):
+    """
+    Checks if the waypoint is behind the vehicle using the dot product between
+    the vehicle's forward vector and the vector from the vehicle to the waypoint.
+    (< 0 indicates behind)
+    """
+    veh_loc = vehicle_transform.location
+    wp_loc = waypoint_transform.location
+
+    forward = vehicle_transform.get_forward_vector()
+    to_waypoint = wp_loc - veh_loc
+
+    dot = (forward.x * to_waypoint.x +
+           forward.y * to_waypoint.y +
+           forward.z * to_waypoint.z)
+    return dot < 0.0
+
+def compute_heading_error(vehicle_transform, waypoint_transform):
+    """
+    Computes the difference in yaw (in degrees) between the vehicle's heading and
+    the target waypoint's heading. The result is normalized to [-180, 180].
+    """
+    veh_yaw = vehicle_transform.rotation.yaw
+    wp_yaw = waypoint_transform.rotation.yaw
+    error = wp_yaw - veh_yaw
+    # Normalize to [-180, 180]
+    while error > 180:
+        error -= 360
+    while error < -180:
+        error += 360
+    return error
+
+# ---------------------------------
+# Sensors
+# ---------------------------------
+class CollisionSensor:
+    def __init__(self, vehicle, blueprint_library, world):
+        self.vehicle = vehicle
+        collision_bp = blueprint_library.find('sensor.other.collision')
+        self.sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=self.vehicle)
+        self.history = []
+        self._listen()
+
+    def _listen(self):
+        self.sensor.listen(lambda event: self.history.append(event))
+
+    def destroy(self):
+        if self.sensor is not None:
+            self.sensor.destroy()
+
+    def get_history(self):
+        return self.history
+
+# ---------------------------------
+# Main Environment
+# ---------------------------------
+class CarlaGymEnv(gym.Env):
+    """
+    Environment that returns a dictionary of scalar observations including:
+      - lateral distance to lane center ("dist_center")
+      - vehicle speed ("speed")
+      - heading error between vehicle and target waypoint ("heading_error")
+      - distance to the next waypoint ("distance_waypoint")
+    """
+    def __init__(self, host='localhost', port=2000, display=True, route_file='recorded_routes/recorded_route.json'):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.display = display  # You may remove or repurpose display if not needed
+        self.route_file = route_file
+
+        # Connect to CARLA
+        self.client = carla.Client(self.host, self.port)
+        self.client.set_timeout(10.0)
+
+        # Load a map (e.g., Town01)
+        #self.world = self.client.load_world('Town01')
+        self.world = self.client.load_world('Town03')
+        self.blueprint_library = self.world.get_blueprint_library()
+        self.map = self.world.get_map()
+
+        # Load the generated route
+        with open(self.route_file, 'r') as f:
+            route_data = json.load(f)
+        self.route_transforms = []
+        for wp in route_data['waypoints']:
+            location = carla.Location(x=wp['x'], y=wp['y'], z=wp['z'])
+            rotation = carla.Rotation(yaw=wp['yaw'])
+            transform = carla.Transform(location, rotation)
+            self.route_transforms.append(transform)
+        self.current_target_idx = 1  # start with the first target after spawn
+
+        # Synchronous Mode
+        self.original_settings = self.world.get_settings()
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05  # 20 FPS
+        self.world.apply_settings(settings)
+
+        # Actors
+        self.vehicle = None
+        self.collision_sensor = None
+
+        # Next Waypoint
+        self.next_waypoint_transform = None
+
+        # Wait for a few ticks after reset (3 seconds at 20 FPS)
+        self.wait_steps = 0
+        self.wait_steps_total = int(3.0 / settings.fixed_delta_seconds)
+
+        # Action Space: [steer, throttle] in [-0.5, 0.5]
+        self.action_space = spaces.Box(low=-0.5, high=0.5, shape=(2,), dtype=np.float32)
+
+        # Observation Space: Using scalar values only
+        self.observation_space = spaces.Dict({
+            "dist_center": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            "speed": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "heading_error": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            "distance_waypoint": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+        })
+
+        # Do an initial reset
+        self.reset()
+
+    # ---------------------------------
+    # Helper Methods
+    # ---------------------------------
+    def _init_vehicle_sensors(self):
+        # Spawn vehicle
+        #vehicle_bp = self.blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
+        vehicle_bp = self.blueprint_library.filter('vehicle.dodge.charger_2020')[0]
+        if len(self.route_transforms) == 0:
+            raise ValueError("No route waypoints available for spawning.")
+        # Use the first spawn point from the map
+        spawn_transform = self.world.get_map().get_spawn_points()[0]
+        self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_transform)
+
+        # Collision sensor
+        self.collision_sensor = CollisionSensor(self.vehicle, self.blueprint_library, self.world)
+
+        # Warm-up ticks for sensors / vehicle state
+        for _ in range(10):
+            self.world.tick()
+
+        # Set the next waypoint
+        self._pick_next_waypoint()
+
+    def _clear_actors(self):
+        if self.collision_sensor is not None:
+            self.collision_sensor.destroy()
+            self.collision_sensor = None
+        if self.vehicle is not None:
+            self.vehicle.destroy()
+            self.vehicle = None
+
+    def _pick_next_waypoint(self):
+        """Set self.next_waypoint_transform to the next waypoint in the route."""
+        if self.current_target_idx < len(self.route_transforms):
+            self.next_waypoint_transform = self.route_transforms[self.current_target_idx]
+            self.current_target_idx += 1
+        else:
+            self.next_waypoint_transform = None
+
+    def get_vehicle_speed(self):
+        """Returns speed in m/s."""
+        if not self.vehicle:
+            return 0.0
+        vel = self.vehicle.get_velocity()
+        return math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+
+    # ---------------------------------
+    # Gym Methods
+    # ---------------------------------
+    def reset(self):
+        """
+        Reset the environment, re-spawning the vehicle until the next waypoint is not behind it.
+        Then wait 3 seconds (self.wait_steps).
+        """
+        self._clear_actors()
+        self.current_target_idx = 1  # Reset the waypoint index for the new episode
+        valid_spawn_found = False
+        while not valid_spawn_found:
+            # Initialize (spawn vehicle and sensors, and call _pick_next_waypoint())
+            self._init_vehicle_sensors()
+
+            if self.next_waypoint_transform is None:
+                # Safety: no waypoint found => try again
+                self._clear_actors()
+                continue
+
+            # Check if the waypoint is behind the vehicle
+            if is_waypoint_behind(self.vehicle.get_transform(), self.next_waypoint_transform):
+                print("Spawn unsuitable (waypoint directly behind vehicle). Trying new spawn...")
+                self._clear_actors()
+            else:
+                valid_spawn_found = True
+
+        # After successful spawn: wait for a short period (3 seconds)
+        self.wait_steps = self.wait_steps_total
+
+        # Return the initial observation
+        return self._get_obs()
+
+    def step(self, action):
+        """
+        If self.wait_steps > 0 we ignore the action (vehicle remains stopped)
+        and return reward=0.
+        """
+        # 1. If still waiting: apply no action, decrease wait_steps, reward=0
+        if self.wait_steps > 0:
+            self.wait_steps -= 1
+            control = carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
+            self.vehicle.apply_control(control)
+            self.world.tick()
+            obs = self._get_obs()
+            return obs, 0.0, False, {}
+
+        # 2. Normal action execution
+        steer = float(clamp(action[0], -0.5, 0.5))
+        throttle = float(clamp(action[1], -0.5, 0.5))
+        # Scale throttle from [-0.5, +0.5] to [0, 1]
+        throttle = (throttle + 0.5)
+        throttle = clamp(throttle, 0.0, 0.5)  # Safety
+
+        control = carla.VehicleControl()
+        control.steer = steer
+        control.throttle = throttle
+        self.vehicle.apply_control(control)
+
+        # Advance one tick
+        self.world.tick()
+
+        # Compute reward, done, and info
+        reward, done, info = self._compute_reward_done_info()
+
+        # Update waypoint if not done
+        if not done and self.next_waypoint_transform is not None:
+            dist = distance_2d(
+                vector_2d(self.vehicle.get_transform().location),
+                vector_2d(self.next_waypoint_transform.location)
+            )
+            if dist < 2.0:
+                print(f"Vehicle is close enough to the waypoint (dist={dist:.2f}). Setting new waypoint.")
+                reward += 1.2
+                self._pick_next_waypoint()
+            elif is_waypoint_behind(self.vehicle.get_transform(), self.next_waypoint_transform):
+                print("Waypoint is already behind us. Choosing the next waypoint.")
+                self._pick_next_waypoint()
+
+        obs = self._get_obs()
+        return obs, reward, done, info
+
+    def _compute_reward_done_info(self):
+        """Compute reward and termination flag."""
+        info = {}
+        done = False
+        reward = 0.0
+    
+        # Check if route is completed
+        if self.current_target_idx >= len(self.route_transforms) and self.next_waypoint_transform is None:
+            print("Route completed successfully!")
+            reward = 10.0
+            done = True
+            info["route_completed"] = True
+            return reward, done, info
+    
+        # 1) Collision => immediate termination with penalty
+        if len(self.collision_sensor.get_history()) > 0:
+            print(">>> Collision detected, terminating episode!")
+            reward = -10.0
+            done = True
+            info["collision"] = True
+            return reward, done, info
+    
+        # 2) Check lane type
+        current_wp = self.map.get_waypoint(
+            self.vehicle.get_transform().location,
+            lane_type=carla.LaneType.Driving
+        )
+        if current_wp.lane_type != carla.LaneType.Driving:
+            print(">>> Vehicle is off the driving lane. Terminating episode!")
+            reward = -10.0
+            done = True
+            info["off_lane"] = True
+            return reward, done, info
+    
+        # 3) Lateral distance to lane center
+        lateral_offset = compute_lateral_offset(
+            self.vehicle.get_transform(),
+            current_wp.transform
+        )
+        offset_magnitude = abs(lateral_offset)
+        max_offset = 1.0  # strict threshold
+    
+        if offset_magnitude >= max_offset:
+            print(">>> Too far from lane center. Terminating episode!")
+            reward = -10.0
+            done = True
+            info["off_center"] = True
+            return reward, done, info
+    
+        dist_center_reward = 0.5 * (1.0 - offset_magnitude / max_offset)
+    
+        # 4) Speed reward
+        speed = self.get_vehicle_speed()
+        if speed < 0.1:
+            speed_reward = -0.5
+        else:
+            capped_speed = min(speed, 10.0)
+            speed_reward = 0.5 * (capped_speed / 10.0)
+    
+        # 5) Drift reward based on slip angle and yaw rate (oversteer detection)
+        heading_error = abs(self._get_obs()["heading_error"][0])
+        curve_threshold = 15.0  # Minimum heading error to consider as curve
+        drift_angle_threshold = 10.0  # Minimum slip angle for drift
+        max_drift_angle = 30.0  # Slip angle for max reward
+        yaw_rate_threshold = 20.0  # Minimum yaw rate (deg/s) for drift
+        max_yaw_rate = 60.0  # Yaw rate for max contribution
+    
+        # Calculate slip angle
+        velocity = self.vehicle.get_velocity()
+        vel_vector = np.array([velocity.x, velocity.y, velocity.z])
+        speed_mag = np.linalg.norm(vel_vector)
+        slip_angle_deg = 0.0
+
+        if speed_mag > 1.0:  # Only calculate if moving >1 m/s
+            forward = self.vehicle.get_transform().get_forward_vector()
+            forward_vector = np.array([forward.x, forward.y, forward.z])
+            vel_dir = vel_vector / speed_mag
+            dot_product = np.dot(forward_vector, vel_dir)
+            
+            if dot_product >= 0:  # Forward motion only
+                dot_product = np.clip(dot_product, 0.0, 1.0)
+                slip_angle_deg = np.degrees(np.arccos(dot_product))
+
+        # Get yaw rate (angular velocity around Z-axis)
+        vehicle_angular_velocity = self.vehicle.get_angular_velocity()
+        yaw_rate_deg = math.degrees(vehicle_angular_velocity.z)
+        is_high_yaw_rate = abs(yaw_rate_deg) > yaw_rate_threshold
+
+        # Determine drift conditions
+        is_curve = abs(heading_error) > curve_threshold
+        is_drifting = (slip_angle_deg > drift_angle_threshold) and is_high_yaw_rate
+
+        # Calculate yaw contribution factor
+        yaw_factor = 0.0
+        if is_high_yaw_rate:
+            yaw_factor = (abs(yaw_rate_deg) - yaw_rate_threshold) / (max_yaw_rate - yaw_rate_threshold)
+            yaw_factor = clamp(yaw_factor, 0.0, 1.0)
+
+        # Drift reward calculation
+        drift_reward = 0.0
+        if is_curve and is_drifting:
+            # Reward based on both slip angle and yaw rate
+            slip_contribution = (min(slip_angle_deg, max_drift_angle) - drift_angle_threshold) / (max_drift_angle - drift_angle_threshold)
+            drift_reward = 0.5 * (slip_contribution * 0.7 + yaw_factor * 0.3)  # Weighted combination
+        elif not is_curve and is_drifting:
+            # Penalize drifting on straight roads
+            drift_reward = -0.3 * (slip_angle_deg / max_drift_angle) * yaw_factor
+
+        # Total reward calculation
+        total_reward = dist_center_reward + speed_reward + drift_reward
+        reward = clamp(total_reward, -1.0, 1.5)
+
+        print(f"Drift: {slip_angle_deg:.1f}° | Yaw: {yaw_rate_deg:.1f}°/s | "
+              f"DriftReward: {drift_reward:.2f} | Total: {reward:.2f}")
+    
+        return reward, done, info
+
+    def _get_obs(self):
+        """
+        Dictionary observation consisting of:
+          - "dist_center": lateral offset to lane center (1,)
+          - "speed": vehicle speed (1,)
+          - "heading_error": difference in yaw between vehicle and target waypoint (1,)
+          - "distance_waypoint": Euclidean distance to next waypoint (1,)
+        """
+        # Lateral distance to center of current lane
+        current_wp = self.map.get_waypoint(
+            self.vehicle.get_transform().location,
+            lane_type=carla.LaneType.Driving
+        )
+        if current_wp is not None:
+            lateral_offset = compute_lateral_offset(
+                self.vehicle.get_transform(),
+                current_wp.transform
+            )
+        else:
+            lateral_offset = 0.0
+        dist_center = np.array([lateral_offset], dtype=np.float32)
+
+        # Vehicle speed
+        speed = np.array([self.get_vehicle_speed()], dtype=np.float32)
+
+        # Heading error: difference between vehicle's yaw and next waypoint's yaw
+        if self.next_waypoint_transform is not None:
+            heading_error = compute_heading_error(self.vehicle.get_transform(), self.next_waypoint_transform)
+        else:
+            heading_error = 0.0
+        heading_error = np.array([heading_error], dtype=np.float32)
+
+        # Euclidean distance to next waypoint
+        if self.next_waypoint_transform is not None:
+            veh_loc = self.vehicle.get_transform().location
+            wp_loc = self.next_waypoint_transform.location
+            distance_waypoint = distance_2d(
+                vector_2d(veh_loc),
+                vector_2d(wp_loc)
+            )
+        else:
+            distance_waypoint = 0.0
+        distance_waypoint = np.array([distance_waypoint], dtype=np.float32)
+
+        return {
+            "dist_center": dist_center,
+            "speed": speed,
+            "heading_error": heading_error,
+            "distance_waypoint": distance_waypoint,
+        }
+
+    def render(self, mode="human"):
+        # No visual rendering is implemented since we now use scalar observations.
+        pass
+
+    def close(self):
+        self._clear_actors()
+        self.world.apply_settings(self.original_settings)
